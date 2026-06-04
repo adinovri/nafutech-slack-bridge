@@ -17,6 +17,7 @@ from .config import (
     ALT_FLUSH_SECS,
     ALT_PASTE_SETTLE_SECS,
     ALT_QUIESCE_SECS,
+    ALT_QUIESCE_STABLE_POLLS,
     ALT_TMUX_SOCKET,
     ALT_TUI_BOOT_SECS,
     CLAUDE_CLI,
@@ -212,6 +213,13 @@ def run_alt(
     last_change = time.monotonic()
     hard_deadline = time.monotonic() + CLAUDE_TIMEOUT
     pos = tail_offset
+    # last assistant stop_reason seen. 'tool_use' = model paused to run a tool,
+    # so the turn is NOT done (a tool_result + further assistant msg follow) —
+    # quiescence must never break while this holds. Reset to None when fresh
+    # assistant text streams in without a tool pause.
+    last_stop_reason: str | None = None
+    # consecutive polls where the pane looked idle — debounces tool latency
+    idle_pane_streak = 0
 
     while True:
         now = time.monotonic()
@@ -245,10 +253,13 @@ def run_alt(
                         except json.JSONDecodeError:
                             continue  # defensive: skip malformed lines
                         stop = _parse_line(obj, text_acc, crumbs)
+                        if stop is not None:
+                            last_stop_reason = stop
                         if stop == "end_turn":  # primary detector
                             _flush(on_update, text_acc, crumbs)
                             return "".join(text_acc).strip(), sess.session_uuid
                     last_change = now
+                    idle_pane_streak = 0  # fresh bytes → not idle
                     touch(thread_ts)
 
         # --- throttled live update ---
@@ -264,8 +275,23 @@ def run_alt(
             break
 
         # --- quiescence fallback: stop_reason unreadable + pane idle ---
-        if idle_secs > ALT_QUIESCE_SECS and text_acc and _pane_idle(sess):
-            break
+        # Only a last resort when end_turn never lands. Suppressed entirely
+        # while the last assistant msg paused for a tool ('tool_use') — that
+        # turn is mid-flight and a tool_result will resume it. Requires the
+        # pane to read idle across several consecutive polls so a transient
+        # MCP/tool-latency gap can't be mistaken for a finished turn.
+        if (idle_secs > ALT_QUIESCE_SECS and text_acc
+                and last_stop_reason != "tool_use"):
+            if _pane_idle(sess):
+                idle_pane_streak += 1
+                if idle_pane_streak >= ALT_QUIESCE_STABLE_POLLS:
+                    log.info(
+                        "alt: quiescence-break %s (idle %.1fs, stop_reason=%s)",
+                        sess.name, idle_secs, last_stop_reason,
+                    )
+                    break
+            else:
+                idle_pane_streak = 0
 
         time.sleep(0.4)
 
@@ -281,14 +307,27 @@ def _flush(on_update: OnUpdate, text_acc: list[str], crumbs: list[str]) -> None:
         log.debug("alt on_update raised; ignored", exc_info=True)
 
 
+# Footer/spinner markers that mean claude is still actively working. The CLI
+# cycles random gerunds in the spinner, so the reliable signals are the
+# "esc to interrupt" hint, the live token counter, and the run timer — all
+# present whenever a tool is executing or the model is generating.
+_BUSY_MARKERS = (
+    "esc to interrupt",
+    "Actioning",
+    "Thinking",
+    "Working",
+    "tokens",
+    "⏵⏵",
+)
+
+
 def _pane_idle(sess: TmuxSession) -> bool:
     """Heuristic fallback: empty input prompt "❯" reappeared at the bottom and
-    no "Actioning…/Thinking…" spinner is visible → turn likely closed."""
+    no busy spinner/footer is visible → turn likely closed."""
     pane = sess.pane_text()
     if not pane:
         return False
     last_lines = pane.splitlines()[-6:]
-    busy = any(("Actioning" in ln or "Thinking" in ln or "esc to interrupt" in ln)
-               for ln in last_lines)
+    busy = any(m in ln for ln in last_lines for m in _BUSY_MARKERS)
     has_prompt = any(ln.strip() in ("❯", "❯ ") for ln in last_lines)
     return has_prompt and not busy

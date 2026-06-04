@@ -32,7 +32,10 @@ CLAUDE_TIMEOUT = int(_env("CLAUDE_TIMEOUT", "600"))
 ALT_MARKER        = _env("ALT_MARKER",        "[alt]")
 ALT_TMUX_SOCKET   = _env("ALT_TMUX_SOCKET",   "nafutech")
 ALT_IDLE_TTL      = int(_env("ALT_IDLE_TTL",      "1800"))
-ALT_QUIESCE_SECS  = float(_env("ALT_QUIESCE_SECS",  "3.5"))
+ALT_QUIESCE_SECS  = float(_env("ALT_QUIESCE_SECS",  "10.0"))
+# how many consecutive idle polls (×0.4s) confirm a turn is closed before we
+# fall back to quiescence-break — debounces transient tool-latency gaps
+ALT_QUIESCE_STABLE_POLLS = int(_env("ALT_QUIESCE_STABLE_POLLS", "3"))
 ALT_FLUSH_SECS    = float(_env("ALT_FLUSH_SECS",    "1.5"))
 ALT_TUI_BOOT_SECS = float(_env("ALT_TUI_BOOT_SECS", "8"))
 ALT_PASTE_SETTLE_SECS = float(_env("ALT_PASTE_SETTLE_SECS", "0.6"))  # paste→Enter gap
