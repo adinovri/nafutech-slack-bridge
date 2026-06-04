@@ -8,12 +8,16 @@ Security gate (only Adi can trigger; everyone else is ignored):
 import logging
 import signal
 import sys
+import threading
+import time
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from . import claude_runner, thread_store
+from . import alt_runner, claude_runner, thread_store
 from .config import (
+    ALT_IDLE_TTL,
+    ALT_MARKER,
     LOG_LEVEL,
     SLACK_APP_TOKEN,
     SLACK_BOT_TOKEN,
@@ -65,6 +69,14 @@ def _chunk_text(text: str, size: int = SLACK_CHUNK_SIZE) -> list[str]:
     return chunks
 
 
+def _detect_alt(user_text: str) -> tuple[bool, str]:
+    """Return (True, text_without_marker) if text starts with ALT_MARKER."""
+    s = user_text.lstrip()
+    if s[: len(ALT_MARKER)].lower() == ALT_MARKER.lower():
+        return True, s[len(ALT_MARKER) :].lstrip()
+    return False, user_text
+
+
 def _build_prompt(event: dict, raw_text: str, bot_user_id: str | None) -> str:
     channel = event["channel"]
     user = event.get("user", "unknown")
@@ -91,7 +103,22 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
     text = event.get("text") or ""
     log.info("trigger: channel=%s thread_ts=%s user=%s", channel, thread_ts, user)
 
-    prompt = _build_prompt(event, text, bot_user_id)
+    # strip mention before marker detection
+    raw = text
+    if bot_user_id:
+        raw = raw.replace(f"<@{bot_user_id}>", "").strip()
+
+    is_alt, clean = _detect_alt(raw)
+    prompt = _build_prompt(event, clean, bot_user_id)
+
+    # alt = one REPL per thread; reject concurrent requests rather than queuing
+    if is_alt and thread_ts in _pending:
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=":warning: Masih ngerjain pesan sebelumnya di thread ini. Tunggu kelar dulu ya.",
+        )
+        return
 
     ack = client.chat_postMessage(
         channel=channel,
@@ -101,27 +128,43 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
     _pending[thread_ts] = (channel, ack["ts"])
 
     state = thread_store.get(thread_ts) or {}
-    session_id = state.get("session_id")
+    # only resume an alt session_id for alt runner (avoids crossing runner types)
+    session_id = state.get("session_id") if (not is_alt or state.get("runner") == "alt") else None
 
     try:
-        result, new_session_id = claude_runner.run(prompt, session_id=session_id)
+        if is_alt:
+            def on_update(partial: str, crumbs: list[str]) -> None:
+                preview = (("\n".join(crumbs) + "\n") if crumbs else "") + partial
+                try:
+                    client.chat_update(
+                        channel=channel, ts=ack["ts"],
+                        text=_chunk_text(preview)[0],
+                    )
+                except Exception:
+                    log.debug("alt on_update chat_update skipped", exc_info=True)
+
+            log.info("alt runner: thread_ts=%s resume_session=%s", thread_ts, session_id)
+            result, new_session_id = alt_runner.run_alt(
+                prompt, thread_ts, session_id, on_update
+            )
+        else:
+            result, new_session_id = claude_runner.run(prompt, session_id=session_id)
+
         thread_store.save(
             thread_ts,
             {
                 "session_id": new_session_id,
                 "channel": channel,
                 "last_user": user,
+                "runner": "alt" if is_alt else "default",
             },
         )
         body = result or "_(empty response)_"
         chunks = _chunk_text(body)
         log.info(
-            "claude reply: chars=%d chunks=%d thread_ts=%s",
-            len(body),
-            len(chunks),
-            thread_ts,
+            "claude reply: chars=%d chunks=%d thread_ts=%s runner=%s",
+            len(body), len(chunks), thread_ts, "alt" if is_alt else "default",
         )
-        # First chunk replaces the "thinking…" message; rest go as new replies in the thread.
         client.chat_update(channel=channel, ts=ack["ts"], text=chunks[0])
         for idx, extra in enumerate(chunks[1:], start=2):
             client.chat_postMessage(
@@ -130,7 +173,7 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
                 text=f"_(cont. {idx}/{len(chunks)})_\n{extra}",
             )
     except Exception:
-        log.exception("claude run failed")
+        log.exception("claude run failed (alt=%s)", is_alt)
         client.chat_update(
             channel=channel,
             ts=ack["ts"],
@@ -197,12 +240,23 @@ def _flush_pending_acks() -> None:
 def _graceful_shutdown(signum, _frame) -> None:
     log.info("received signal %s; shutting down", signum)
     _flush_pending_acks()
+    alt_runner.kill_all()
     sys.exit(0)
+
+
+def _reaper_loop() -> None:
+    while True:
+        time.sleep(60)
+        try:
+            alt_runner.reap_idle(ALT_IDLE_TTL)
+        except Exception:
+            log.exception("alt reaper error")
 
 
 def main() -> None:
     signal.signal(signal.SIGTERM, _graceful_shutdown)
     signal.signal(signal.SIGINT, _graceful_shutdown)
+    threading.Thread(target=_reaper_loop, daemon=True, name="alt-reaper").start()
     log.info(
         "starting socket mode handler (trigger_sender=%s, workspace=%s)",
         TRIGGER_USER_ID,

@@ -28,4 +28,15 @@ CLAUDE_MODEL = _env("CLAUDE_MODEL", "claude-sonnet-4-6")
 CLAUDE_PERMISSION_MODE = _env("CLAUDE_PERMISSION_MODE", "bypassPermissions")
 CLAUDE_TIMEOUT = int(_env("CLAUDE_TIMEOUT", "600"))
 
+# --- alt runner (pola shannon: tmux + tail JSONL) ---
+ALT_MARKER        = _env("ALT_MARKER",        "[alt]")
+ALT_TMUX_SOCKET   = _env("ALT_TMUX_SOCKET",   "nafutech")
+ALT_IDLE_TTL      = int(_env("ALT_IDLE_TTL",      "1800"))
+ALT_QUIESCE_SECS  = float(_env("ALT_QUIESCE_SECS",  "3.5"))
+ALT_FLUSH_SECS    = float(_env("ALT_FLUSH_SECS",    "1.5"))
+ALT_TUI_BOOT_SECS = float(_env("ALT_TUI_BOOT_SECS", "8"))
+ALT_PASTE_SETTLE_SECS = float(_env("ALT_PASTE_SETTLE_SECS", "0.6"))  # paste→Enter gap
+# injected by systemd; fallback to ~/.claude for local dev
+CLAUDE_CONFIG_DIR = Path(_env("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")
