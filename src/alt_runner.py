@@ -136,18 +136,38 @@ class TmuxSession:
 # JSONL parsing
 # ---------------------------------------------------------------------------
 
-def _parse_line(obj: dict, text_acc: list[str], crumbs: list[str]) -> str | None:
-    """Update accumulators from one JSONL line. Returns stop_reason if present."""
+def _parse_line(
+    obj: dict, text_acc: list[str], crumbs: list[str]
+) -> tuple[str | None, bool]:
+    """Update accumulators from one JSONL line.
+
+    Returns (stop_reason, had_text) where had_text is True iff THIS assistant
+    message carried a visible text block. With extended thinking enabled, the
+    CLI writes the thinking block as its own assistant record that already
+    carries stop_reason='end_turn', ~seconds before the visible-text record
+    (also end_turn). Reporting had_text lets the caller ignore that premature
+    thinking-only end_turn and wait for the real answer.
+    """
     if obj.get("type") != "assistant":
-        return None
+        return None, False
     msg = obj.get("message") or {}
+    # Skip CLI-internal placeholders. When a turn is processed but nothing needs
+    # answering (e.g. a "Continue from where you left off." flush with no pending
+    # work), the CLI emits a synthetic assistant record (model="<synthetic>",
+    # stop_reason="stop_sequence", text="No response requested."). It is not a
+    # real answer — accumulating its text leaks it to Telegram via _flush and the
+    # quiescence fallback. Drop it whole: no text, no crumbs, no stop_reason.
+    if msg.get("model") == "<synthetic>":
+        return None, False
+    had_text = False
     for block in msg.get("content", []):
         btype = block.get("type")
         if btype == "text":
+            had_text = True
             text_acc.append(block.get("text", ""))
         elif btype == "tool_use":
             crumbs.append(f"🔧 {block.get('name', 'tool')}…")
-    return msg.get("stop_reason")  # 'end_turn' | 'tool_use' | None
+    return msg.get("stop_reason"), had_text  # 'end_turn' | 'tool_use' | None
 
 
 # ---------------------------------------------------------------------------
@@ -252,10 +272,25 @@ def run_alt(
                             obj = json.loads(raw_line)
                         except json.JSONDecodeError:
                             continue  # defensive: skip malformed lines
-                        stop = _parse_line(obj, text_acc, crumbs)
+                        stop, had_text = _parse_line(obj, text_acc, crumbs)
                         if stop is not None:
                             last_stop_reason = stop
-                        if stop == "end_turn":  # primary detector
+                        # primary detector — return ONLY on the end_turn record
+                        # that itself carries the visible answer text (had_text).
+                        # With extended thinking the CLI emits a thinking-only
+                        # record stamped end_turn a few seconds BEFORE the real
+                        # answer — and that artifact precedes EVERY answer, not
+                        # just the first. So we must NOT fall back to "any text
+                        # accumulated so far": if the model emitted interim intent
+                        # text earlier in the turn (e.g. "Siap, gue cek sekarang."
+                        # with stop_reason=tool_use), that stale text would make
+                        # the thinking-only end_turn return prematurely, truncating
+                        # the turn to the intent line. If a turn ever ends with no
+                        # text in the final record, the quiescence fallback below
+                        # (last_stop_reason is now end_turn, so no longer
+                        # suppressed) still returns the accumulated text within
+                        # ALT_QUIESCE_SECS.
+                        if stop == "end_turn" and had_text:
                             _flush(on_update, text_acc, crumbs)
                             return "".join(text_acc).strip(), sess.session_uuid
                     last_change = now

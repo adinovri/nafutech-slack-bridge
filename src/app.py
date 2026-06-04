@@ -92,6 +92,10 @@ def _build_prompt(event: dict, raw_text: str, bot_user_id: str | None) -> str:
         f"Reply concisely in the same language as the user. "
         f"The text below is the user's message — only respond to that, "
         f"do not invent additional context.\n\n"
+        f"IMPORTANT: Reply as plain text only. Do NOT post your reply to this "
+        f"thread yourself via any Slack tool (e.g. slack_bot / "
+        f"conversations_add_message) — the bridge posts your answer for you. "
+        f"Just return the text.\n\n"
         f"---\n{stripped}"
     )
 
