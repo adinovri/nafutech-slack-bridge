@@ -6,6 +6,7 @@ saat teks user diawali ALT_MARKER. Jaminan keamanan identik runner lama:
 """
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -18,6 +19,8 @@ from .config import (
     ALT_PASTE_SETTLE_SECS,
     ALT_QUIESCE_SECS,
     ALT_QUIESCE_STABLE_POLLS,
+    ALT_SUBMIT_RETRIES,
+    ALT_SUBMIT_VERIFY_SECS,
     ALT_TMUX_SOCKET,
     ALT_TUI_BOOT_SECS,
     CLAUDE_CLI,
@@ -62,6 +65,48 @@ def _transcript_path(session_uuid: str) -> Path:
     return CLAUDE_CONFIG_DIR / "projects" / _mangled_cwd() / f"{session_uuid}.jsonl"
 
 
+# Status-bar token-count cell, e.g. "0/200.0K" or "20.0K/200.0K". Only renders on
+# the live main-session chrome, never on a blocking interstitial — a reliable
+# "real input box is up and accepting" signal across CLI versions.
+_STATUSBAR_RE = re.compile(r"\d[\d.]*K?/\d[\d.]*K")
+
+# A blocking full-screen startup menu (folder-trust, settings-warning, theme
+# picker, update notice) renders a numbered selection whose cursor is "❯ N." at
+# the start of a line. The real input prompt is "❯ " followed by free text,
+# never "❯ <digit>.".
+_MENU_CURSOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.M)
+
+
+def _real_prompt_marker(pane: str) -> bool:
+    """True iff the live main-session input chrome is on screen. Kept broad to
+    survive CLI version churn (v2.1.x moved footer text)."""
+    return (
+        any(kw in pane for kw in ("shift+tab to cycle", "for shortcuts", "│ >"))
+        or bool(_STATUSBAR_RE.search(pane))
+    )
+
+
+def _is_interstitial(pane: str) -> bool:
+    """A blocking startup menu is in front of the input box. Pasting a prompt
+    into one gets it swallowed by the menu's Enter handler. Detected by the
+    "❯ N." menu cursor or the "Enter to confirm" hint AND the absence of every
+    real-prompt marker."""
+    if _real_prompt_marker(pane):
+        return False
+    return bool(_MENU_CURSOR_RE.search(pane)) or "Enter to confirm" in pane
+
+
+def _paste_probe(prompt: str) -> str:
+    """A short, distinctive slice of the prompt to look for in the input box as
+    proof the paste actually landed. First non-trivial line, capped — the wide
+    pane (220 cols) means it won't wrap within this length."""
+    for ln in prompt.splitlines():
+        ln = ln.strip()
+        if len(ln) >= 4:
+            return ln[:40]
+    return prompt.strip()[:40]
+
+
 # ---------------------------------------------------------------------------
 # TmuxSession
 # ---------------------------------------------------------------------------
@@ -103,27 +148,96 @@ class TmuxSession:
             raise RuntimeError(f"tmux new-session failed: {r.stderr.strip()}")
         self._wait_tui_ready()
 
-    def _wait_tui_ready(self) -> None:
-        # Real TUI footer/prompt markers (CLI 2.1.x): the input prompt is "❯",
-        # and the footer shows the permission/shortcut hint. Old keywords
-        # ("│ >", "> ") never matched → boot detection always timed out.
+    def _wait_tui_ready(self) -> bool:
+        """Poll until the live input prompt is on screen AND quiescent.
+
+        A ready marker alone is NOT enough: on a cold fresh-spawn the markers
+        (❯ / shortcut hint / "│ >") flash on the splash screen at ~2s while the
+        TUI is still repainting its welcome chrome and the 4 MCP servers are
+        still loading — a paste fired into that window gets dropped or wiped on
+        the next re-render (the intermittent inject failure). So we additionally
+        require the marker-bearing frame to be captured UNCHANGED twice in a row
+        (quiescent = done repainting) before declaring ready, and we dismiss any
+        blocking startup menu first. Returns True on ready, False on timeout —
+        the caller submits optimistically and relies on the post-submit
+        verify/resend loop to recover."""
         deadline = time.monotonic() + ALT_TUI_BOOT_SECS
+        last_pane = None
+        stable_hits = 0
+        dismissed = 0
         while time.monotonic() < deadline:
+            if not self._alive():
+                return False
             pane = _tmux("capture-pane", "-p", "-t", self.name).stdout
-            if any(kw in pane for kw in ("❯", "shift+tab to cycle", "? for shortcuts")):
-                return
+
+            # Clear a blocking startup menu before it can swallow the prompt.
+            # Enter accepts the highlighted default (option 1 = the safe/proceed
+            # choice). Loop to peel stacked dialogs; the cap stops key-spamming
+            # the real prompt if detection ever misfires.
+            if _is_interstitial(pane) and dismissed < 5:
+                log.warning("alt: interstitial menu on %s — accepting default #%d",
+                            self.name, dismissed + 1)
+                _tmux("send-keys", "-t", self.name, "Enter")
+                dismissed += 1
+                stable_hits = 0
+                last_pane = None
+                time.sleep(0.8)
+                continue
+
+            if _real_prompt_marker(pane) and pane == last_pane:
+                stable_hits += 1
+                if stable_hits >= 2:
+                    time.sleep(0.6)
+                    return True
+            else:
+                stable_hits = 0
+            last_pane = pane
             time.sleep(0.4)
         log.warning("alt: TUI boot timeout for %s, continuing optimistically", self.name)
+        return False
 
-    def send_prompt(self, prompt: str) -> None:
-        # multi-line via bracketed paste — avoids REPL submitting per line
-        _tmux("set-buffer", "--", prompt)
-        _tmux("paste-buffer", "-p", "-t", self.name)
-        # The TUI debounces bracketed paste; an Enter sent in the same instant
-        # gets absorbed and the prompt sits unsent in the input box. Give the
-        # paste a moment to settle, THEN submit as a distinct key event.
-        time.sleep(ALT_PASTE_SETTLE_SECS)
+    def send_prompt(self, prompt: str) -> bool:
+        """Paste the prompt, CONFIRM its own text rendered in the input box,
+        THEN submit. The fresh-spawn race: a paste fired while the TUI is still
+        settling (splash chrome, MCP loading) is dropped/wiped on re-render, so
+        Enter hits an empty box and the turn never starts (the bug). Verifying
+        the probe text appeared before pressing Enter closes that race;
+        re-paste up to 3x. Returns True if a confirmed paste was submitted,
+        False if we pressed Enter as a last-ditch with no visible paste (the
+        caller's transcript-growth verify is the final backstop either way)."""
+        probe = _paste_probe(prompt)
+        for paste_try in range(3):
+            if paste_try > 0:
+                self._clear_input()  # drop any stale half-paste before retrying
+            # multi-line via bracketed paste — avoids REPL submitting per line
+            _tmux("set-buffer", "--", prompt)
+            _tmux("paste-buffer", "-p", "-t", self.name)
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                time.sleep(0.2)
+                pane = self.pane_text()
+                # status-bar churn (MCP counts settling, token cell) can't satisfy
+                # this — only the prompt's own text or the paste chip does.
+                if (probe and probe in pane) or "[Pasted text #" in pane:
+                    # The TUI debounces bracketed paste; let the box settle, THEN
+                    # submit as a distinct key event so Enter isn't absorbed.
+                    time.sleep(ALT_PASTE_SETTLE_SECS)
+                    _tmux("send-keys", "-t", self.name, "Enter")
+                    return True
+            log.warning("alt: paste not visible on %s, re-paste %d/3",
+                        self.name, paste_try + 1)
+        # Never confirmed after retries — submit anyway so the outer verify loop
+        # can observe the non-acceptance and escalate.
         _tmux("send-keys", "-t", self.name, "Enter")
+        return False
+
+    def _clear_input(self) -> None:
+        """Dismiss any interstitial and clear a half-entered line so a resend
+        isn't appended to a stale paste."""
+        _tmux("send-keys", "-t", self.name, "Escape")
+        time.sleep(0.2)
+        _tmux("send-keys", "-t", self.name, "C-u")
+        time.sleep(0.2)
 
     def pane_text(self) -> str:
         return _tmux("capture-pane", "-p", "-t", self.name).stdout
@@ -197,6 +311,20 @@ def reap_idle(idle_ttl: int) -> None:
             log.info("alt reaper: killed idle session %s", name)
 
 
+def _wait_for_accept(sess: TmuxSession, tail_offset: int) -> bool:
+    """After submit, the CLI appends the user turn to the transcript right away.
+    Transcript growth past tail_offset = the prompt landed. Returns False if the
+    session dies or nothing lands within ALT_SUBMIT_VERIFY_SECS (→ resend)."""
+    deadline = time.monotonic() + ALT_SUBMIT_VERIFY_SECS
+    while time.monotonic() < deadline:
+        if sess.jsonl.exists() and sess.jsonl.stat().st_size > tail_offset:
+            return True
+        if not sess._alive():
+            return False
+        time.sleep(0.3)
+    return False
+
+
 def kill_all() -> None:
     """Kill all nafu_* sessions. Called on bridge shutdown."""
     result = _tmux("list-sessions", "-F", "#{session_name}")
@@ -225,7 +353,34 @@ def run_alt(
 
     # snapshot byte offset BEFORE sending — avoids triggering on previous turns
     tail_offset = sess.jsonl.stat().st_size if sess.jsonl.exists() else 0
-    sess.send_prompt(prompt)
+
+    # Submit + verify the prompt actually landed in the transcript. The paste
+    # can be lost if the TUI is still settling (cold start, MCP loading), so we
+    # resend until the transcript grows past tail_offset. Cause-agnostic: any
+    # reason the prompt fails to land triggers a resend, not just one mode.
+    accepted = False
+    for submit_try in range(1 + ALT_SUBMIT_RETRIES):
+        if submit_try > 0:
+            if not sess._alive():
+                break
+            log.warning("alt: prompt not accepted on %s, resend %d/%d",
+                        sess.name, submit_try, ALT_SUBMIT_RETRIES)
+            sess._clear_input()
+            sess._wait_tui_ready()
+        sess.send_prompt(prompt)
+        if _wait_for_accept(sess, tail_offset):
+            accepted = True
+            break
+
+    if not accepted:
+        # Either the session died, or the prompt never landed after all resends.
+        msg = ("_(⚠️ proses berhenti mendadak — kemungkinan crash atau auth gagal)_"
+               if not sess._alive()
+               else "_(⚠️ prompt gagal terkirim ke TUI setelah beberapa percobaan)_")
+        log.error("alt: prompt never accepted on %s after %d tries",
+                  sess.name, 1 + ALT_SUBMIT_RETRIES)
+        _flush(on_update, [msg], [])
+        return msg, sess.session_uuid
 
     text_acc: list[str] = []
     crumbs: list[str] = []

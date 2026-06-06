@@ -37,8 +37,12 @@ ALT_QUIESCE_SECS  = float(_env("ALT_QUIESCE_SECS",  "10.0"))
 # fall back to quiescence-break — debounces transient tool-latency gaps
 ALT_QUIESCE_STABLE_POLLS = int(_env("ALT_QUIESCE_STABLE_POLLS", "3"))
 ALT_FLUSH_SECS    = float(_env("ALT_FLUSH_SECS",    "1.5"))
-ALT_TUI_BOOT_SECS = float(_env("ALT_TUI_BOOT_SECS", "8"))
+ALT_TUI_BOOT_SECS = float(_env("ALT_TUI_BOOT_SECS", "10"))
 ALT_PASTE_SETTLE_SECS = float(_env("ALT_PASTE_SETTLE_SECS", "0.6"))  # paste→Enter gap
+# after submit, how long to wait for the user turn to land in the transcript
+# (proof the paste was accepted) before resending
+ALT_SUBMIT_VERIFY_SECS = float(_env("ALT_SUBMIT_VERIFY_SECS", "8"))
+ALT_SUBMIT_RETRIES     = int(_env("ALT_SUBMIT_RETRIES", "2"))
 # injected by systemd; fallback to ~/.claude for local dev
 CLAUDE_CONFIG_DIR = Path(_env("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
