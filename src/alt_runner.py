@@ -19,6 +19,7 @@ from .config import (
     ALT_PASTE_SETTLE_SECS,
     ALT_QUIESCE_SECS,
     ALT_QUIESCE_STABLE_POLLS,
+    ALT_RESUME_FORK_SECS,
     ALT_SUBMIT_RETRIES,
     ALT_SUBMIT_VERIFY_SECS,
     ALT_TMUX_SOCKET,
@@ -61,8 +62,18 @@ def _mangled_cwd() -> str:
     return str(NAFUTECH_WORKSPACE).replace("/", "-").replace(".", "-")
 
 
+def _project_dir() -> Path:
+    return CLAUDE_CONFIG_DIR / "projects" / _mangled_cwd()
+
+
 def _transcript_path(session_uuid: str) -> Path:
-    return CLAUDE_CONFIG_DIR / "projects" / _mangled_cwd() / f"{session_uuid}.jsonl"
+    return _project_dir() / f"{session_uuid}.jsonl"
+
+
+def _snapshot_transcripts() -> set[str]:
+    """Filenames of all *.jsonl transcripts in the project dir right now."""
+    pdir = _project_dir()
+    return {p.name for p in pdir.glob("*.jsonl")} if pdir.exists() else set()
 
 
 # Status-bar token-count cell, e.g. "0/200.0K" or "20.0K/200.0K". Only renders on
@@ -124,11 +135,18 @@ class TmuxSession:
 
     def ensure(self) -> None:
         if self._alive():
+            # Live REPL already appends to self.jsonl (the file it forked to on
+            # its own spawn). Nothing to rebind — the stored uuid matches it.
             return
         # resume preserves context; --session-id starts fresh with deterministic path
+        resuming = self.jsonl.exists()
+        # Snapshot existing transcripts BEFORE a resume spawn: --resume writes the
+        # replayed history into a NEW <uuid>.jsonl, so the live file is whatever
+        # appears that wasn't here before.
+        prior = _snapshot_transcripts() if resuming else set()
         id_flag = (
             ["--resume", self.session_uuid]
-            if self.jsonl.exists()
+            if resuming
             else ["--session-id", self.session_uuid]
         )
         cmd = [
@@ -147,6 +165,42 @@ class TmuxSession:
         if r.returncode != 0:
             raise RuntimeError(f"tmux new-session failed: {r.stderr.strip()}")
         self._wait_tui_ready()
+        if resuming:
+            self._rebind_to_fork(prior)
+
+    def _rebind_to_fork(self, prior: set[str]) -> None:
+        """`claude --resume <uuid>` does NOT append to <uuid>.jsonl — it forks the
+        whole conversation into a fresh <new-uuid>.jsonl (fresh sessionId = its
+        own filename) and writes the replayed history there at load time. Without
+        this, both the submit-verify loop and the streaming tail watch the stale
+        resumed file, which never grows → false "prompt gagal terkirim", and the
+        returned uuid stays the old one so the NEXT resume re-forks from the
+        original and silently drops every intermediate turn.
+
+        After a resume spawn we poll for the file that appeared post-spawn and
+        rebind tailing + session_uuid to it. The TUI-ready gate means history
+        replay is already flushed, so exactly one new main-session file exists
+        (no subagent sidechains yet — no prompt has been sent). On timeout we
+        leave self.jsonl on the original file: no worse than the prior bug, and
+        the rare append-style CLI build (no fork) keeps working untouched."""
+        deadline = time.monotonic() + ALT_RESUME_FORK_SECS
+        pdir = _project_dir()
+        while time.monotonic() < deadline:
+            new = [pdir / n for n in (_snapshot_transcripts() - prior)]
+            new = [p for p in new if p.exists() and p.stat().st_size > 0]
+            if new:
+                live = max(new, key=lambda p: p.stat().st_mtime)
+                log.info("alt: resume %s forked → live transcript %s on %s",
+                         self.session_uuid, live.stem, self.name)
+                self.session_uuid = live.stem
+                self.jsonl = live
+                return
+            if not self._alive():
+                return
+            time.sleep(0.3)
+        log.warning("alt: resume fork file not found for %s within %.0fs; "
+                    "tailing original %s", self.name, ALT_RESUME_FORK_SECS,
+                    self.session_uuid)
 
     def _wait_tui_ready(self) -> bool:
         """Poll until the live input prompt is on screen AND quiescent.

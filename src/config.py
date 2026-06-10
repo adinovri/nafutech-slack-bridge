@@ -43,6 +43,10 @@ ALT_PASTE_SETTLE_SECS = float(_env("ALT_PASTE_SETTLE_SECS", "0.6"))  # paste→E
 # (proof the paste was accepted) before resending
 ALT_SUBMIT_VERIFY_SECS = float(_env("ALT_SUBMIT_VERIFY_SECS", "8"))
 ALT_SUBMIT_RETRIES     = int(_env("ALT_SUBMIT_RETRIES", "2"))
+# `claude --resume <uuid>` forks history into a NEW <uuid>.jsonl rather than
+# appending to the resumed file. After a resume spawn, how long to wait for that
+# forked transcript to appear before falling back to tailing the original.
+ALT_RESUME_FORK_SECS   = float(_env("ALT_RESUME_FORK_SECS", "10"))
 # injected by systemd; fallback to ~/.claude for local dev
 CLAUDE_CONFIG_DIR = Path(_env("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
 
