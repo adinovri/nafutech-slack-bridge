@@ -30,6 +30,7 @@ CLAUDE_TIMEOUT = int(_env("CLAUDE_TIMEOUT", "600"))
 
 # --- alt runner (pola shannon: tmux + tail JSONL) ---
 ALT_MARKER        = _env("ALT_MARKER",        "[alt]")
+BG_MARKER         = _env("BG_MARKER",         "[bg]")
 ALT_TMUX_SOCKET   = _env("ALT_TMUX_SOCKET",   "nafutech")
 ALT_IDLE_TTL      = int(_env("ALT_IDLE_TTL",      "1800"))
 ALT_QUIESCE_SECS  = float(_env("ALT_QUIESCE_SECS",  "10.0"))
