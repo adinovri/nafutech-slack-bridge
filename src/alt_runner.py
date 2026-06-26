@@ -118,6 +118,41 @@ def _paste_probe(prompt: str) -> str:
     return prompt.strip()[:40]
 
 
+def _tool_display(name: str, input_dict: dict) -> str:
+    """Format tool name + brief input preview for Slack display.
+
+    mcp__claude_ai_Atlassian__getJiraIssue → Atlassian:getJiraIssue(HNWI-123)
+    Read → Read(src/app.py)
+    Bash → Bash(git log --oneline...)
+    """
+    # Strip MCP namespace prefix
+    display_name = name
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            server = parts[1].replace("claude_ai_", "").replace("claude_", "")
+            display_name = f"{server}:{parts[2]}"
+
+    # Extract a brief input preview — prefer known field names, then fallback
+    preview = ""
+    if input_dict:
+        for key in ("file_path", "query", "command", "prompt", "issue_key",
+                    "channel_id", "path", "page_id", "jql", "cql"):
+            val = input_dict.get(key)
+            if val and isinstance(val, str):
+                val = val.strip().replace("\n", " ")
+                preview = val[:45] + ("…" if len(val) > 45 else "")
+                break
+        if not preview:
+            for val in input_dict.values():
+                if isinstance(val, str) and val.strip():
+                    val = val.strip().replace("\n", " ")
+                    preview = val[:45] + ("…" if len(val) > 45 else "")
+                    break
+
+    return f"{display_name}({preview})" if preview else display_name
+
+
 # ---------------------------------------------------------------------------
 # TmuxSession
 # ---------------------------------------------------------------------------
@@ -305,9 +340,16 @@ class TmuxSession:
 # ---------------------------------------------------------------------------
 
 def _parse_line(
-    obj: dict, text_acc: list[str], crumbs: list[str]
+    obj: dict,
+    text_acc: list[str],
+    pending_tools: dict[str, str],
+    done_tools: list[str],
 ) -> tuple[str | None, bool]:
     """Update accumulators from one JSONL line.
+
+    Handles two message types:
+    - type=="assistant": extract tool_use (→ pending) and text blocks
+    - type=="user": extract tool_result completions (pending → done)
 
     Returns (stop_reason, had_text) where had_text is True iff THIS assistant
     message carried a visible text block. With extended thinking enabled, the
@@ -316,8 +358,21 @@ def _parse_line(
     (also end_turn). Reporting had_text lets the caller ignore that premature
     thinking-only end_turn and wait for the real answer.
     """
-    if obj.get("type") != "assistant":
+    msg_type = obj.get("type")
+
+    if msg_type == "user":
+        # Tool results land here — move pending → done to mark completion
+        msg = obj.get("message") or {}
+        for block in msg.get("content", []):
+            if block.get("type") == "tool_result":
+                tool_id = block.get("tool_use_id", "")
+                if tool_id and tool_id in pending_tools:
+                    done_tools.append(pending_tools.pop(tool_id))
         return None, False
+
+    if msg_type != "assistant":
+        return None, False
+
     msg = obj.get("message") or {}
     # Skip CLI-internal placeholders. When a turn is processed but nothing needs
     # answering (e.g. a "Continue from where you left off." flush with no pending
@@ -327,6 +382,7 @@ def _parse_line(
     # quiescence fallback. Drop it whole: no text, no crumbs, no stop_reason.
     if msg.get("model") == "<synthetic>":
         return None, False
+
     had_text = False
     for block in msg.get("content", []):
         btype = block.get("type")
@@ -334,8 +390,39 @@ def _parse_line(
             had_text = True
             text_acc.append(block.get("text", ""))
         elif btype == "tool_use":
-            crumbs.append(f"🔧 {block.get('name', 'tool')}…")
+            tool_id = block.get("id") or f"_noid_{len(pending_tools)}"
+            tool_name = block.get("name", "tool")
+            tool_input = block.get("input") or {}
+            pending_tools[tool_id] = _tool_display(tool_name, tool_input)
+
     return msg.get("stop_reason"), had_text  # 'end_turn' | 'tool_use' | None
+
+
+def _build_output(
+    text_acc: list[str],
+    pending_tools: dict[str, str],
+    done_tools: list[str],
+) -> str:
+    """Render structured progress + answer into a single Slack-ready string.
+
+    ✅ Read(src/app.py)
+    ✅ Bash(git log --oneline)
+    🔄 Atlassian:getJiraIssue(HNWI-123)…
+
+    [answer text]
+    """
+    lines: list[str] = []
+    for name in done_tools:
+        lines.append(f"✅ {name}")
+    for name in pending_tools.values():
+        lines.append(f"🔄 {name}…")
+
+    progress = "\n".join(lines)
+    text = "".join(text_acc).strip()
+
+    if progress and text:
+        return f"{progress}\n\n{text}"
+    return progress or text or "_(empty response)_"
 
 
 # ---------------------------------------------------------------------------
@@ -433,11 +520,12 @@ def run_alt(
                else "_(⚠️ prompt gagal terkirim ke TUI setelah beberapa percobaan)_")
         log.error("alt: prompt never accepted on %s after %d tries",
                   sess.name, 1 + ALT_SUBMIT_RETRIES)
-        _flush(on_update, [msg], [])
+        on_update(msg, [])
         return msg, sess.session_uuid
 
     text_acc: list[str] = []
-    crumbs: list[str] = []
+    pending_tools: dict[str, str] = {}  # tool_use_id → display string (in-flight)
+    done_tools: list[str] = []          # ordered list of completed tool displays
     last_flush = time.monotonic()
     last_change = time.monotonic()
     hard_deadline = time.monotonic() + CLAUDE_TIMEOUT
@@ -481,7 +569,7 @@ def run_alt(
                             obj = json.loads(raw_line)
                         except json.JSONDecodeError:
                             continue  # defensive: skip malformed lines
-                        stop, had_text = _parse_line(obj, text_acc, crumbs)
+                        stop, had_text = _parse_line(obj, text_acc, pending_tools, done_tools)
                         if stop is not None:
                             last_stop_reason = stop
                         # primary detector — return ONLY on the end_turn record
@@ -500,15 +588,16 @@ def run_alt(
                         # suppressed) still returns the accumulated text within
                         # ALT_QUIESCE_SECS.
                         if stop == "end_turn" and had_text:
-                            _flush(on_update, text_acc, crumbs)
-                            return "".join(text_acc).strip(), sess.session_uuid
+                            final = _build_output(text_acc, pending_tools, done_tools)
+                            on_update(final, [])
+                            return final, sess.session_uuid
                     last_change = now
                     idle_pane_streak = 0  # fresh bytes → not idle
                     touch(thread_ts)
 
         # --- throttled live update ---
-        if now - last_flush >= ALT_FLUSH_SECS and text_acc:
-            _flush(on_update, text_acc, crumbs)
+        if now - last_flush >= ALT_FLUSH_SECS and (text_acc or pending_tools or done_tools):
+            on_update(_build_output(text_acc, pending_tools, done_tools), [])
             last_flush = now
 
         idle_secs = now - last_change
@@ -539,16 +628,9 @@ def run_alt(
 
         time.sleep(0.4)
 
-    final = "".join(text_acc).strip() or "_(empty response)_"
-    _flush(on_update, text_acc, crumbs)
+    final = _build_output(text_acc, pending_tools, done_tools)
+    on_update(final, [])
     return final, sess.session_uuid
-
-
-def _flush(on_update: OnUpdate, text_acc: list[str], crumbs: list[str]) -> None:
-    try:
-        on_update("".join(text_acc).strip(), list(crumbs))
-    except Exception:
-        log.debug("alt on_update raised; ignored", exc_info=True)
 
 
 # Footer/spinner markers that mean claude is still actively working. The CLI

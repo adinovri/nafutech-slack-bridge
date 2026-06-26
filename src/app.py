@@ -5,11 +5,15 @@ Security gate (only Adi can trigger; everyone else is ignored):
   - In DM (im): any message from Adi to the bot (no mention required)
   - Bot messages and non-Adi authors are always ignored
 """
+import json
 import logging
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -19,11 +23,16 @@ from .config import (
     ALT_IDLE_TTL,
     ALT_MARKER,
     BG_MARKER,
+    CLAUDE_CONFIG_DIR,
     LOG_LEVEL,
+    NAFUTECH_WORKSPACE,
     SLACK_APP_TOKEN,
     SLACK_BOT_TOKEN,
     TRIGGER_USER_ID,
 )
+
+NAFU_BG_CLAUDE = str(NAFUTECH_WORKSPACE / "nafu-bg-claude")
+BG_REGISTRY    = Path.home() / ".openclaw" / "bg_registry.json"
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -43,11 +52,9 @@ SLACK_CHUNK_SIZE = 3800
 # subprocess.run dies before it can chat_update, leaving the placeholder stuck
 # forever. The shutdown handler flushes whatever is still here so the user gets
 # a clear "retrigger" message instead of a permanent "thinking…".
+# NOTE: [bg] tasks are NOT tracked here — they survive bridge restarts via
+# nafu-bg-watchdog and update Slack directly when done.
 _pending: dict[str, tuple[str, str]] = {}
-
-# Background threads spawned by [alt][bg] dispatches. Tracked for graceful
-# shutdown (best-effort join before exit).
-_bg_threads: list[threading.Thread] = []
 
 
 def _chunk_text(text: str, size: int = SLACK_CHUNK_SIZE) -> list[str]:
@@ -93,52 +100,14 @@ def _detect_markers(user_text: str) -> tuple[bool, bool, str]:
     return is_alt, is_bg, s
 
 
-def _run_bg_task(
-    channel: str,
-    thread_ts: str,
-    ack_ts: str,
-    prompt: str,
-    session_id: str | None,
-    client,
-    user: str | None,
-) -> None:
-    """Worker for [alt][bg] background tasks. Runs in a daemon thread."""
+
+def _has_active_bg(thread_ts: str) -> bool:
+    """Check registry for an active [bg] task on this Slack thread."""
     try:
-        result, new_session_id = alt_runner.run_alt(
-            prompt, thread_ts, session_id,
-            on_update=lambda *_: None,  # no streaming preview in bg mode
-        )
-        thread_store.save(
-            thread_ts,
-            {
-                "session_id": new_session_id,
-                "channel": channel,
-                "last_user": user,
-                "runner": "alt",
-            },
-        )
-        body = result or "_(empty response)_"
-        chunks = _chunk_text(body)
-        log.info(
-            "bg task done: chars=%d chunks=%d thread_ts=%s",
-            len(body), len(chunks), thread_ts,
-        )
-        client.chat_update(channel=channel, ts=ack_ts, text=chunks[0])
-        for idx, extra in enumerate(chunks[1:], start=2):
-            client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f"_(cont. {idx}/{len(chunks)})_\n{extra}",
-            )
+        entries = json.loads(BG_REGISTRY.read_text())
+        return any(e.get("slack_thread_ts") == thread_ts for e in entries)
     except Exception:
-        log.exception("bg task failed thread_ts=%s", thread_ts)
-        client.chat_update(
-            channel=channel,
-            ts=ack_ts,
-            text=":warning: Maaf, task background gagal. Coba retrigger.",
-        )
-    finally:
-        _pending.pop(thread_ts, None)
+        return False
 
 
 def _build_prompt(event: dict, raw_text: str, bot_user_id: str | None) -> str:
@@ -179,8 +148,16 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
     is_alt, is_bg, clean = _detect_markers(raw)
     prompt = _build_prompt(event, clean, bot_user_id)
 
-    # alt/bg = one REPL per thread; reject concurrent requests rather than queuing
-    if (is_alt or is_bg) and thread_ts in _pending:
+    # alt/bg = one REPL per thread; reject concurrent requests rather than queuing.
+    # [bg] tasks live in the registry (survive restarts), [alt] tasks in _pending.
+    if is_bg and _has_active_bg(thread_ts):
+        client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=":warning: Masih ngerjain task background di thread ini. Tunggu kelar dulu ya.",
+        )
+        return
+    if is_alt and not is_bg and thread_ts in _pending:
         client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
@@ -205,25 +182,30 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
     session_id = state.get("session_id") if (not is_alt or state.get("runner") == "alt") else None
 
     if is_bg:
-        t = threading.Thread(
-            target=_run_bg_task,
-            args=(channel, thread_ts, ack["ts"], prompt, session_id, client, user),
-            daemon=True,
-            name=f"bg-{thread_ts}",
+        notify_cfg = {
+            "type":      "slack",
+            "bot_token": SLACK_BOT_TOKEN,
+            "channel":   channel,
+            "thread_ts": thread_ts,
+            "ack_ts":    ack["ts"],
+        }
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR)}
+        subprocess.Popen(
+            ["python3", NAFU_BG_CLAUDE, f"slack:{thread_ts[:12]}", prompt,
+             "--notify-json", json.dumps(notify_cfg)],
+            env=env,
         )
-        _bg_threads.append(t)
-        t.start()
-        log.info("bg task spawned: thread_ts=%s resume_session=%s", thread_ts, session_id)
-        return  # non-blocking; worker handles _pending cleanup and reply
+        log.info("bg task launched via nafu-bg-claude: thread_ts=%s", thread_ts)
+        return  # watchdog handles ack update + cleanup
 
     try:
         if is_alt:
-            def on_update(partial: str, crumbs: list[str]) -> None:
-                preview = (("\n".join(crumbs) + "\n") if crumbs else "") + partial
+            def on_update(partial: str, _crumbs: list[str]) -> None:
+                # structured progress + answer already combined by alt_runner._build_output
                 try:
                     client.chat_update(
                         channel=channel, ts=ack["ts"],
-                        text=_chunk_text(preview)[0],
+                        text=_chunk_text(partial)[0],
                     )
                 except Exception:
                     log.debug("alt on_update chat_update skipped", exc_info=True)
@@ -325,8 +307,6 @@ def _flush_pending_acks() -> None:
 def _graceful_shutdown(signum, _frame) -> None:
     log.info("received signal %s; shutting down", signum)
     _flush_pending_acks()
-    for t in list(_bg_threads):
-        t.join(timeout=5)
     alt_runner.kill_all()
     sys.exit(0)
 
