@@ -101,13 +101,13 @@ def _detect_markers(user_text: str) -> tuple[bool, bool, str]:
 
 
 
-def _has_active_bg(thread_ts: str) -> bool:
-    """Check registry for an active [bg] task on this Slack thread."""
+def _get_thread_bg_tasks(thread_ts: str) -> list[dict]:
+    """Return active bg tasks for this Slack thread from the registry."""
     try:
         entries = json.loads(BG_REGISTRY.read_text())
-        return any(e.get("slack_thread_ts") == thread_ts for e in entries)
+        return [e for e in entries if e.get("slack_thread_ts") == thread_ts]
     except Exception:
-        return False
+        return []
 
 
 def _build_prompt(event: dict, raw_text: str, bot_user_id: str | None) -> str:
@@ -148,15 +148,8 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
     is_alt, is_bg, clean = _detect_markers(raw)
     prompt = _build_prompt(event, clean, bot_user_id)
 
-    # alt/bg = one REPL per thread; reject concurrent requests rather than queuing.
-    # [bg] tasks live in the registry (survive restarts), [alt] tasks in _pending.
-    if is_bg and _has_active_bg(thread_ts):
-        client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=":warning: Masih ngerjain task background di thread ini. Tunggu kelar dulu ya.",
-        )
-        return
+    # [alt] tasks: one REPL per thread — reject concurrent to avoid session collision.
+    # [bg] tasks: parallel is fine — each spawns its own tmux session.
     if is_alt and not is_bg and thread_ts in _pending:
         client.chat_postMessage(
             channel=channel,
@@ -175,13 +168,25 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
         thread_ts=thread_ts,
         text=ack_text,
     )
-    _pending[thread_ts] = (channel, ack["ts"])
+    # [bg] tasks are NOT tracked in _pending — watchdog manages their lifecycle.
+    # Only [alt]/default tasks need shutdown-flush on bridge restart.
+    if not is_bg:
+        _pending[thread_ts] = (channel, ack["ts"])
 
     state = thread_store.get(thread_ts) or {}
     # only resume an alt session_id for alt/bg runner (avoids crossing runner types)
     session_id = state.get("session_id") if (not is_alt or state.get("runner") == "alt") else None
 
     if is_bg:
+        # Inject sibling context: other bg tasks already running in this thread
+        siblings = _get_thread_bg_tasks(thread_ts)
+        if siblings:
+            ctx = "[Thread context: bg tasks currently running in this thread:\n"
+            for s in siblings:
+                ctx += f"  - {s.get('description', '?')} (started {s.get('started_at', '?')[:16]})\n"
+            ctx += "]\n\n"
+            prompt = ctx + prompt
+
         notify_cfg = {
             "type":      "slack",
             "bot_token": SLACK_BOT_TOKEN,
@@ -195,7 +200,8 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
              "--notify-json", json.dumps(notify_cfg)],
             env=env,
         )
-        log.info("bg task launched via nafu-bg-claude: thread_ts=%s", thread_ts)
+        log.info("bg task launched via nafu-bg-claude: thread_ts=%s siblings=%d",
+                 thread_ts, len(siblings))
         return  # watchdog handles ack update + cleanup
 
     try:
