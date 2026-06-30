@@ -411,11 +411,19 @@ def _build_output(
 
     [answer text]
     """
+    from collections import Counter
     lines: list[str] = []
-    for name in done_tools:
-        lines.append(f"✅ {name}")
+    if done_tools:
+        type_counts: Counter = Counter(t.split("(")[0] for t in done_tools)
+        parts = [
+            f"{k} ×{v}" if v > 1 else k
+            for k, v in type_counts.most_common(6)
+        ]
+        if len(type_counts) > 6:
+            parts.append(f"+{len(type_counts) - 6} more")
+        lines.append(f":white_check_mark: {len(done_tools)} tools — {', '.join(parts)}")
     for name in pending_tools.values():
-        lines.append(f"🔄 {name}…")
+        lines.append(f":hourglass_flowing_sand: {name}…")
 
     progress = "\n".join(lines)
     text = "".join(text_acc).strip()
