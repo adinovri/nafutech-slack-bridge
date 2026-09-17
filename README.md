@@ -238,6 +238,26 @@ launchctl bootout   gui/$(id -u) \
   ~/Library/LaunchAgents/io.nanovest.nafu-bg-watchdog.plist
 ```
 
+### Uninstall
+
+Same two-script split, same three modes. Both are **safe by default** — they
+stop the service and remove the OS-side unit/plist files, and touch nothing
+else. `.env`, the repo itself, `~/.openclaw/`, and (macOS) the optional
+Telegram env file all stay put; delete by hand if you want them gone.
+
+```bash
+bash uninstall_linux.sh            # stop + disable services, remove systemd units
+bash uninstall_linux.sh --purge    # + wipe .venv/, logs/, src/**/__pycache__
+bash uninstall_linux.sh --dry-run  # preview what would happen
+
+bash uninstall_mac.sh              # bootout + remove both LaunchAgents
+bash uninstall_mac.sh --purge      # + wipe .venv/, logs/, src/**/__pycache__
+bash uninstall_mac.sh --dry-run    # preview
+```
+
+To fully wipe the machine, run `--purge` and then `rm -rf` the repo — that's
+all that's left.
+
 ### Templates you may need to inspect
 
 Everything the installer copies lives in the repo under version control:
@@ -306,6 +326,8 @@ deploy/                                 templates copied by run_linux.sh / run_m
 run.sh              foreground entrypoint (sources .env, execs `python -m src.app`) — used by systemd/launchd
 run_linux.sh        one-shot: prereq check + venv + systemd install + start
 run_mac.sh          one-shot: prereq check + venv + LaunchAgent install + start
+uninstall_linux.sh  reverse of run_linux.sh — --purge also wipes .venv/logs, --dry-run to preview
+uninstall_mac.sh    reverse of run_mac.sh   — --purge also wipes .venv/logs, --dry-run to preview
 ```
 
 Per-thread state lives at `$THREAD_STORE_DIR/<thread_ts>.json`:
