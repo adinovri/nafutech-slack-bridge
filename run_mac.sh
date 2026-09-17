@@ -10,12 +10,8 @@
 # will auto-restart on crash + start when you log in to the console.
 #
 # NOTE: LaunchAgents only run while you're logged in on the Mac console. For
-# a headless server that starts before login, you'd promote the plist to
+# a headless server that starts before login, you'd promote the plists to
 # /Library/LaunchDaemons/ (requires sudo). This script does not do that.
-#
-# NOTE: The [bg] runner's watchdog is NOT wired up on macOS by this script.
-# If you need [bg] mode, wire nafu-bg-watchdog into a periodic launchd task
-# yourself (or use cron).
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -137,40 +133,47 @@ if [ "$MODE" = "no-service" ]; then
 fi
 
 # ============================================================================
-# 6. launchd install
+# 6. launchd install (bridge + [bg] watchdog)
 # ============================================================================
-say "installing LaunchAgent"
-PLIST_NAME="io.nanovest.nafutech-slack-bridge.plist"
-DEST="$HOME/Library/LaunchAgents/$PLIST_NAME"
+say "installing LaunchAgents"
 mkdir -p "$HOME/Library/LaunchAgents"
 
 # Detect Homebrew prefix for PATH (Intel: /usr/local, Apple Silicon: /opt/homebrew)
 BREW_PREFIX="/usr/local"
 [ -d /opt/homebrew ] && BREW_PREFIX="/opt/homebrew"
 
-# Substitute placeholders in the template plist
-sed \
-  -e "s|/Users/USERNAME|$HOME|g" \
-  -e "s|/opt/homebrew/bin:/usr/local/bin|$BREW_PREFIX/bin|g" \
-  "deploy/launchd/$PLIST_NAME" > "$DEST"
-ok "plist installed to $DEST"
+install_plist() {
+  local plist_name="$1" label="$2"
+  local dest="$HOME/Library/LaunchAgents/$plist_name"
 
-# Idempotent: bootout first if already loaded, then bootstrap+enable+start
-launchctl bootout "gui/$(id -u)" "$DEST" 2>/dev/null || true
-launchctl bootstrap "gui/$(id -u)" "$DEST"
-launchctl enable    "gui/$(id -u)/io.nanovest.nafutech-slack-bridge"
-launchctl kickstart -k "gui/$(id -u)/io.nanovest.nafutech-slack-bridge"
-ok "LaunchAgent bootstrapped + started"
+  sed \
+    -e "s|/Users/USERNAME|$HOME|g" \
+    -e "s|/opt/homebrew/bin:/usr/local/bin|$BREW_PREFIX/bin|g" \
+    "deploy/launchd/$plist_name" > "$dest"
+
+  # Idempotent: bootout first if already loaded, then bootstrap+enable+start
+  launchctl bootout "gui/$(id -u)" "$dest" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$dest"
+  launchctl enable    "gui/$(id -u)/$label"
+  launchctl kickstart -k "gui/$(id -u)/$label"
+  ok "$label installed + started"
+}
+
+install_plist "io.nanovest.nafutech-slack-bridge.plist" "io.nanovest.nafutech-slack-bridge"
+install_plist "io.nanovest.nafu-bg-watchdog.plist"      "io.nanovest.nafu-bg-watchdog"
 
 # ============================================================================
 # 7. Status
 # ============================================================================
 say "status"
-launchctl print "gui/$(id -u)/io.nanovest.nafutech-slack-bridge" 2>/dev/null | sed -n '1,15p' || true
+launchctl print "gui/$(id -u)/io.nanovest.nafutech-slack-bridge" 2>/dev/null | sed -n '1,6p' || true
+echo
+launchctl print "gui/$(id -u)/io.nanovest.nafu-bg-watchdog"      2>/dev/null | sed -n '1,6p' || true
 echo
 echo "──────────────────────────────────────────────────"
-echo "Logs:      tail -f logs/bot.log"
-echo "Restart:   launchctl kickstart -k gui/\$(id -u)/io.nanovest.nafutech-slack-bridge"
-echo "Stop:      launchctl bootout   gui/\$(id -u) $DEST"
+echo "Bridge logs:    tail -f logs/bot.log"
+echo "Watchdog logs:  tail -f logs/watchdog.log"
+echo "Restart bridge: launchctl kickstart -k gui/\$(id -u)/io.nanovest.nafutech-slack-bridge"
+echo "Stop all:       launchctl bootout gui/\$(id -u) ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist"
+echo "                launchctl bootout gui/\$(id -u) ~/Library/LaunchAgents/io.nanovest.nafu-bg-watchdog.plist"
 echo "──────────────────────────────────────────────────"
-warn "[bg] mode watchdog is not auto-installed on macOS — see README for wiring nafu-bg-watchdog into launchd/cron if you need it."

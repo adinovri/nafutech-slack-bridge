@@ -191,7 +191,7 @@ What each script installs:
 | | Linux (`run_linux.sh`) | macOS (`run_mac.sh`) |
 |---|---|---|
 | bridge | systemd user unit `nafutech-slack-bridge.service` (enabled + started) | LaunchAgent `io.nanovest.nafutech-slack-bridge` (bootstrapped + started) |
-| `[bg]` watchdog | systemd oneshot `nafu-bg-watchdog.service` + `.timer` (fires every 15s) | **not automated** — wire `scripts/nafu-bg-watchdog` into cron/launchd if you need `[bg]` |
+| `[bg]` watchdog | systemd oneshot `nafu-bg-watchdog.service` + `.timer` (fires every 15s) | LaunchAgent `io.nanovest.nafu-bg-watchdog` with `StartInterval=15` (bootstrapped + started) |
 | Python venv | `.venv/` under repo root | same |
 | script permissions | `chmod +x scripts/*` | same |
 | `.env` guard | rejects the sample placeholders; refuses to enable service until real tokens are in place | same |
@@ -224,12 +224,18 @@ systemctl --user disable --now nafutech-slack-bridge nafu-bg-watchdog.timer
 
 ```bash
 # logs
-tail -f logs/bot.log
+tail -f logs/bot.log         # bridge
+tail -f logs/watchdog.log    # [bg] watchdog (fires every 15s)
 
-# lifecycle
-launchctl kickstart -k gui/$(id -u)/io.nanovest.nafutech-slack-bridge          # restart
+# lifecycle — bridge
+launchctl kickstart -k gui/$(id -u)/io.nanovest.nafutech-slack-bridge
 launchctl bootout   gui/$(id -u) \
-  ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist               # unload
+  ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist
+
+# lifecycle — [bg] watchdog
+launchctl kickstart -k gui/$(id -u)/io.nanovest.nafu-bg-watchdog
+launchctl bootout   gui/$(id -u) \
+  ~/Library/LaunchAgents/io.nanovest.nafu-bg-watchdog.plist
 ```
 
 ### Templates you may need to inspect
@@ -242,7 +248,8 @@ deploy/systemd/
   nafu-bg-watchdog.service        # oneshot — reads $BG_REGISTRY + optional Telegram env file
   nafu-bg-watchdog.timer          # 15-second cadence
 deploy/launchd/
-  io.nanovest.nafutech-slack-bridge.plist   # template — installer sed-substitutes USERNAME + brew prefix
+  io.nanovest.nafutech-slack-bridge.plist   # bridge — installer sed-substitutes USERNAME + brew prefix
+  io.nanovest.nafu-bg-watchdog.plist        # [bg] watchdog — StartInterval=15s, sources optional Telegram env file
 ```
 
 Change these in the repo, rerun `bash run_linux.sh` / `bash run_mac.sh`, and
@@ -293,8 +300,8 @@ scripts/                                [bg] runtime — bridge spawns nafu-bg-c
   nafu-notify       curl → Telegram (reads NAFU_TG_BOT_TOKEN + NAFU_TG_CHAT_ID; NO hardcoded secrets)
 
 deploy/                                 templates copied by run_linux.sh / run_mac.sh
-  systemd/          service, watchdog service, watchdog timer (%h-based, portable)
-  launchd/          LaunchAgent plist (USERNAME placeholder, installer substitutes)
+  systemd/          bridge service, watchdog service, watchdog timer (%h-based, portable)
+  launchd/          bridge LaunchAgent, watchdog LaunchAgent (StartInterval=15s)
 
 run.sh              foreground entrypoint (sources .env, execs `python -m src.app`) — used by systemd/launchd
 run_linux.sh        one-shot: prereq check + venv + systemd install + start

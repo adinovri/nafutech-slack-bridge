@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for the [bg] runner watchdog — the launchd equivalent
+  of nafu-bg-watchdog.timer on Linux. Fires every 15s (StartInterval), scans
+  ~/.openclaw/bg_registry.json, posts results back to Slack, cleans up.
+
+  The wrapping bash -c: source the optional Telegram env file (mode 600) if
+  it exists, then exec the watchdog. Sourcing keeps NAFU_TG_* out of this
+  plist so ~/Library/LaunchAgents/*.plist (world-readable) never holds
+  secrets. If the file is absent, the watchdog runs without Telegram — that's
+  fine, Slack notify still works.
+
+  The installer (run_mac.sh) sed-substitutes /Users/USERNAME and the
+  Homebrew prefix.
+
+  Load / start:
+    launchctl bootstrap gui/$(id -u) \
+      ~/Library/LaunchAgents/io.nanovest.nafu-bg-watchdog.plist
+    launchctl enable    gui/$(id -u)/io.nanovest.nafu-bg-watchdog
+    launchctl kickstart -k gui/$(id -u)/io.nanovest.nafu-bg-watchdog
+
+  Unload:
+    launchctl bootout gui/$(id -u) \
+      ~/Library/LaunchAgents/io.nanovest.nafu-bg-watchdog.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.nanovest.nafu-bg-watchdog</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>[ -f "$HOME/.config/nafutech-slack-bridge.env" ] &amp;&amp; . "$HOME/.config/nafutech-slack-bridge.env"; exec "/Users/USERNAME/Codes/nafutech-slack-bridge/scripts/nafu-bg-watchdog"</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/USERNAME/Codes/nafutech-slack-bridge</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/USERNAME</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>BG_REGISTRY</key>
+    <string>/Users/USERNAME/.openclaw/bg_registry.json</string>
+    <key>NAFU_NOTIFY_BIN</key>
+    <string>/Users/USERNAME/Codes/nafutech-slack-bridge/scripts/nafu-notify</string>
+  </dict>
+
+  <!-- Fire immediately on load, then every 15s. If a previous run is still
+       going, launchd skips the next tick instead of spawning a second copy. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>15</integer>
+
+  <!-- Oneshot: exit is normal, do NOT keep alive. -->
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/Codes/nafutech-slack-bridge/logs/watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/Codes/nafutech-slack-bridge/logs/watchdog.log</string>
+</dict>
+</plist>
