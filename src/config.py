@@ -31,6 +31,12 @@ CLAUDE_TIMEOUT = int(_env("CLAUDE_TIMEOUT", "600"))
 # --- alt runner (pola shannon: tmux + tail JSONL) ---
 ALT_MARKER        = _env("ALT_MARKER",        "[alt]")
 BG_MARKER         = _env("BG_MARKER",         "[bg]")
+# Shared bg-task registry — bridge writes acks, nafu-bg-claude appends new
+# tasks, nafu-bg-watchdog polls + reaps. All three MUST agree on this path.
+BG_REGISTRY       = Path(_env(
+    "BG_REGISTRY",
+    str(Path.home() / ".openclaw" / "bg_registry.json"),
+))
 ALT_TMUX_SOCKET   = _env("ALT_TMUX_SOCKET",   "nafutech")
 ALT_IDLE_TTL      = int(_env("ALT_IDLE_TTL",      "1800"))
 ALT_QUIESCE_SECS  = float(_env("ALT_QUIESCE_SECS",  "10.0"))

@@ -129,202 +129,168 @@ App: `nanotech_bot` (existing).
 > Note: `message.channels`/`message.groups`/`message.mpim` are intentionally NOT
 > subscribed — channel mentions go through `app_mention` only.
 
-## Local setup
+## Prerequisites
+
+Both `run_linux.sh` and `run_mac.sh` check these for you and print an
+install hint if anything is missing. If you'd rather install first, here's the
+full list:
+
+| tool | version | why |
+|---|---|---|
+| **python3** | **≥ 3.10** | source uses PEP 585 generics (`dict[str, tuple[...]]`) |
+| python3-venv | matching | to create `.venv/` |
+| **tmux** | any recent | `[alt]` and `[bg]` runners drive Claude in a tmux TUI |
+| **curl** | any | Telegram notify (`nafu-notify`) uses it |
+| **claude** CLI | latest | the actual worker — see [Claude Code install docs](https://docs.anthropic.com/en/docs/claude-code) or `npm i -g @anthropic-ai/claude-code` |
+| **systemctl** (Linux) | any | to run as a user service — skip with `--no-service` |
+| **launchctl** (macOS) | any | to install as a LaunchAgent — skip with `--no-service` |
+| jq (optional) | any | pretty-print `~/.openclaw/bg_registry.json` in debug commands |
+
+Quick install lines:
+
+- **Ubuntu/Debian:** `sudo apt-get install -y python3 python3-venv tmux curl jq`
+- **macOS (Homebrew):** `brew install python@3.12 tmux jq`  (curl ships with macOS)
+- **claude CLI:** `npm i -g @anthropic-ai/claude-code` (needs Node 18+) — or follow the official doc
+
+On Linux, also enable **linger** once so your user services survive logout and
+start on boot:
 
 ```bash
+sudo loginctl enable-linger "$USER"
+```
+
+## Quickstart — fresh clone to running service
+
+Same three steps on both platforms. The bootstrap script does the venv + deps +
+runtime dirs + systemd/launchd install for you.
+
+```bash
+git clone <this-repo> ~/Codes/nafutech-slack-bridge
 cd ~/Codes/nafutech-slack-bridge
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 
+# 1. copy the env template + fill in your real tokens
 cp .env.example .env
-# SLACK_BOT_TOKEN   ← BW NANOTECH_OAUTH_TOKEN (xoxb-...)
-# SLACK_APP_TOKEN   ← BW NANOTECH_APP_TOKEN   (xapp-...)
+chmod 600 .env
 $EDITOR .env
+#   SLACK_BOT_TOKEN   ← BW item NANOTECH_OAUTH_TOKEN (xoxb-...)
+#   SLACK_APP_TOKEN   ← BW item NANOTECH_APP_TOKEN   (xapp-...)
+#   NAFUTECH_WORKSPACE, THREAD_STORE_DIR, BG_REGISTRY — adjust to your paths
 
-./run.sh
+# 2. one-shot install (Linux)
+bash run_linux.sh
+#    …or macOS
+bash run_mac.sh
 ```
 
-Logs go to stdout; redirect to `logs/bot.log` if running detached.
+After the installer finishes, the bridge is running as a user-level service
+that auto-restarts on crash and starts on boot. Tokens in `.env` are used
+via `run.sh` (which the service invokes).
 
-Make sure the log dir exists before running detached / as a service:
+What each script installs:
+
+| | Linux (`run_linux.sh`) | macOS (`run_mac.sh`) |
+|---|---|---|
+| bridge | systemd user unit `nafutech-slack-bridge.service` (enabled + started) | LaunchAgent `io.nanovest.nafutech-slack-bridge` (bootstrapped + started) |
+| `[bg]` watchdog | systemd oneshot `nafu-bg-watchdog.service` + `.timer` (fires every 15s) | **not automated** — wire `scripts/nafu-bg-watchdog` into cron/launchd if you need `[bg]` |
+| Python venv | `.venv/` under repo root | same |
+| script permissions | `chmod +x scripts/*` | same |
+| `.env` guard | rejects the sample placeholders; refuses to enable service until real tokens are in place | same |
+
+### Modes
 
 ```bash
-mkdir -p logs
-chmod 600 .env
+bash run_linux.sh --check        # verify prerequisites, do nothing else
+bash run_linux.sh --no-service   # everything except systemd install (run foreground with ./run.sh)
+bash run_linux.sh                # full install + start service (default)
 ```
 
-## Deploy as a service (auto-restart on reboot)
+`run_mac.sh` takes the same three modes.
 
-Pick your platform. Both variants run as the current user (no root needed), tail
-into `logs/bot.log`, and restart on crash.
+### Service ops (after install)
 
-### Linux — systemd user unit
+**Linux — systemd:**
 
-1. **Enable linger** so user services keep running after logout and start on
-   boot without a login session:
+```bash
+# logs
+journalctl --user -fu nafutech-slack-bridge
+journalctl --user -fu nafu-bg-watchdog
 
-   ```bash
-   sudo loginctl enable-linger "$USER"
-   ```
+# lifecycle
+systemctl --user restart nafutech-slack-bridge
+systemctl --user disable --now nafutech-slack-bridge nafu-bg-watchdog.timer
+```
 
-2. **Write the unit** to `~/.config/systemd/user/nafutech-slack-bridge.service`:
+**macOS — launchd:**
 
-   ```ini
-   [Unit]
-   Description=NafuTech Slack Bridge (Slack -> Claude Code)
-   After=network-online.target
-   Wants=network-online.target
-   StartLimitBurst=5
-   StartLimitIntervalSec=60
+```bash
+# logs
+tail -f logs/bot.log
 
-   [Service]
-   Type=simple
-   WorkingDirectory=%h/Codes/nafutech-slack-bridge
-   ExecStart=%h/Codes/nafutech-slack-bridge/run.sh
-   Restart=on-failure
-   RestartSec=5
-   TimeoutStopSec=30
-   KillMode=process
-   StandardOutput=append:%h/Codes/nafutech-slack-bridge/logs/bot.log
-   StandardError=append:%h/Codes/nafutech-slack-bridge/logs/bot.log
-   Environment=HOME=%h
-   Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
-   Environment=CLAUDE_CONFIG_DIR=%h/ClaudeConfigs/adi.novriansyah
+# lifecycle
+launchctl kickstart -k gui/$(id -u)/io.nanovest.nafutech-slack-bridge          # restart
+launchctl bootout   gui/$(id -u) \
+  ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist               # unload
+```
 
-   [Install]
-   WantedBy=default.target
-   ```
+### Templates you may need to inspect
 
-   > `%h` expands to `$HOME`. Adjust `PATH` and `CLAUDE_CONFIG_DIR` if your
-   > setup differs. `KillMode=process` keeps the `[alt]` tmux sessions alive
-   > across bridge restarts (the bridge kills them itself on graceful shutdown).
+Everything the installer copies lives in the repo under version control:
 
-3. **Enable + start**:
+```
+deploy/systemd/
+  nafutech-slack-bridge.service   # bridge — uses %h for $HOME
+  nafu-bg-watchdog.service        # oneshot — reads $BG_REGISTRY + optional Telegram env file
+  nafu-bg-watchdog.timer          # 15-second cadence
+deploy/launchd/
+  io.nanovest.nafutech-slack-bridge.plist   # template — installer sed-substitutes USERNAME + brew prefix
+```
 
-   ```bash
-   systemctl --user daemon-reload
-   systemctl --user enable --now nafutech-slack-bridge
-   ```
+Change these in the repo, rerun `bash run_linux.sh` / `bash run_mac.sh`, and
+they're re-copied.
 
-4. **Verify**:
+### Optional — Telegram notify for `[bg]` fallback
 
-   ```bash
-   systemctl --user status nafutech-slack-bridge
-   journalctl --user -fu nafutech-slack-bridge
-   ```
+`[bg]` tasks always notify Slack (that's what the bridge sets on dispatch).
+If you also use `scripts/nafu-bg` (a generic "run any shell command in
+background") or trigger `nafu-bg-claude` outside the bridge, the fallback
+notifier is Telegram via `scripts/nafu-notify`. Give it credentials in a
+private file:
 
-   Common ops:
+```bash
+umask 077
+cat > ~/.config/nafutech-slack-bridge.env <<'EOF'
+NAFU_TG_BOT_TOKEN=123456:AA…      # from @BotFather
+NAFU_TG_CHAT_ID=1234567890         # your chat id
+EOF
+```
 
-   ```bash
-   systemctl --user restart nafutech-slack-bridge
-   systemctl --user stop nafutech-slack-bridge
-   systemctl --user disable --now nafutech-slack-bridge   # stop autostart
-   ```
-
-### macOS — launchd (LaunchAgent)
-
-1. **Write the plist** to
-   `~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist`. Replace
-   `USERNAME` with your Mac username (`$(whoami)`) and adjust `PATH` for
-   Intel (`/usr/local/bin`) vs Apple Silicon (`/opt/homebrew/bin`):
-
-   ```xml
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-     <key>Label</key>
-     <string>io.nanovest.nafutech-slack-bridge</string>
-
-     <key>ProgramArguments</key>
-     <array>
-       <string>/Users/USERNAME/Codes/nafutech-slack-bridge/run.sh</string>
-     </array>
-
-     <key>WorkingDirectory</key>
-     <string>/Users/USERNAME/Codes/nafutech-slack-bridge</string>
-
-     <key>EnvironmentVariables</key>
-     <dict>
-       <key>HOME</key>
-       <string>/Users/USERNAME</string>
-       <key>PATH</key>
-       <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-       <key>CLAUDE_CONFIG_DIR</key>
-       <string>/Users/USERNAME/ClaudeConfigs/adi.novriansyah</string>
-     </dict>
-
-     <key>RunAtLoad</key>
-     <true/>
-
-     <key>KeepAlive</key>
-     <dict>
-       <key>SuccessfulExit</key>
-       <false/>
-       <key>Crashed</key>
-       <true/>
-     </dict>
-
-     <key>ThrottleInterval</key>
-     <integer>10</integer>
-
-     <key>StandardOutPath</key>
-     <string>/Users/USERNAME/Codes/nafutech-slack-bridge/logs/bot.log</string>
-     <key>StandardErrorPath</key>
-     <string>/Users/USERNAME/Codes/nafutech-slack-bridge/logs/bot.log</string>
-   </dict>
-   </plist>
-   ```
-
-   > LaunchAgents do **not** support `~` — every path must be absolute. A
-   > LaunchAgent runs when the user is logged in on the console; if you need it
-   > to start before login (e.g. headless server), promote to a `LaunchDaemon`
-   > under `/Library/LaunchDaemons/` (requires `sudo`).
-
-2. **Load + start**:
-
-   ```bash
-   launchctl bootstrap gui/$(id -u) \
-     ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist
-   launchctl enable gui/$(id -u)/io.nanovest.nafutech-slack-bridge
-   launchctl kickstart -k gui/$(id -u)/io.nanovest.nafutech-slack-bridge
-   ```
-
-3. **Verify**:
-
-   ```bash
-   launchctl print gui/$(id -u)/io.nanovest.nafutech-slack-bridge | head -30
-   tail -f ~/Codes/nafutech-slack-bridge/logs/bot.log
-   ```
-
-   Common ops:
-
-   ```bash
-   # restart
-   launchctl kickstart -k gui/$(id -u)/io.nanovest.nafutech-slack-bridge
-
-   # stop (until next login/reboot)
-   launchctl kill SIGTERM gui/$(id -u)/io.nanovest.nafutech-slack-bridge
-
-   # unload / disable autostart
-   launchctl bootout gui/$(id -u) \
-     ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist
-   ```
-
-   > Older `launchctl load -w …` / `unload -w …` still works but is deprecated
-   > since macOS 10.11 — prefer the `bootstrap` / `bootout` verbs above.
+The watchdog systemd unit reads this file via
+`EnvironmentFile=-%h/.config/nafutech-slack-bridge.env` (the `-` prefix means
+the file is optional — no error if it's absent).
 
 ## File layout
 
 ```
-src/
-  app.py            slack-bolt listener + dispatch (two runners, reaper loop, shutdown flush)
+src/                                    Python source (bridge process)
+  app.py            slack-bolt listener + dispatch (three runners, reaper loop, shutdown flush)
   claude_runner.py  default runner: spawns `claude -p --output-format json [--resume]`
   alt_runner.py     [alt] runner: TmuxSession per thread, JSONL transcript tail, live updates
   thread_store.py   read/write threads/<thread_ts>.json (session_id + runner type)
   config.py         env var parsing
+
+scripts/                                [bg] runtime — bridge spawns nafu-bg-claude; watchdog polls
+  nafu-bg-claude    launch a Claude task in a detached tmux session, append to $BG_REGISTRY
+  nafu-bg-watchdog  poll the registry every 15s, notify (Slack/Telegram) on end_turn, reap orphans
+  nafu-bg           run an arbitrary shell command in background via systemd-run + Telegram notify
+  nafu-notify       curl → Telegram (reads NAFU_TG_BOT_TOKEN + NAFU_TG_CHAT_ID; NO hardcoded secrets)
+
+deploy/                                 templates copied by run_linux.sh / run_mac.sh
+  systemd/          service, watchdog service, watchdog timer (%h-based, portable)
+  launchd/          LaunchAgent plist (USERNAME placeholder, installer substitutes)
+
+run.sh              foreground entrypoint (sources .env, execs `python -m src.app`) — used by systemd/launchd
+run_linux.sh        one-shot: prereq check + venv + systemd install + start
+run_mac.sh          one-shot: prereq check + venv + LaunchAgent install + start
 ```
 
 Per-thread state lives at `$THREAD_STORE_DIR/<thread_ts>.json`:
@@ -366,9 +332,16 @@ ALT_QUIESCE_STABLE_POLLS 3       consecutive idle pane polls to confirm turn clo
 
 # [bg] runner
 BG_MARKER            [bg]        prefix to select the bg runner (case-insensitive)
-                                 (registry lives at ~/.openclaw/bg_registry.json;
-                                  worker binary: $NAFUTECH_WORKSPACE/nafu-bg-claude;
-                                  supervisor: $NAFUTECH_WORKSPACE/nafu-bg-watchdog)
+BG_REGISTRY          ~/.openclaw/bg_registry.json
+                                 shared registry file — bridge, nafu-bg-claude,
+                                 and nafu-bg-watchdog MUST agree on this path.
+                                 Bridge passes it through to the subprocess.
+
+# Optional — Telegram fallback for nafu-bg / non-Slack nafu-bg-claude callers.
+# Keep these OUT of .env; put them in ~/.config/nafutech-slack-bridge.env
+# (mode 600). The watchdog systemd unit reads that file via EnvironmentFile=-.
+NAFU_TG_BOT_TOKEN    (unset)     Telegram bot token (from @BotFather)
+NAFU_TG_CHAT_ID      (unset)     Telegram chat id
 
 LOG_LEVEL            INFO
 ```

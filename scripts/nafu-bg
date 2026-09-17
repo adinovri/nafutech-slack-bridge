@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# nafu-bg — Run an arbitrary shell command in the background via systemd-run,
+# then send a Telegram notification on completion (success or failure).
+#
+# This is a generic helper for one-off commands (DB exports, batch jobs, etc.),
+# NOT the Slack-bridge [bg] path. The bridge uses nafu-bg-claude directly for
+# Claude sessions.
+#
+# Usage:
+#   nafu-bg <description> <command> [args...]
+#
+# Examples:
+#   nafu-bg "export prod DB" gcloud sql export sql my-instance gs://bucket/dump.sql
+#   nafu-bg "run whitelist" bash /path/to/run_whitelist.sh
+#
+# Environment:
+#   NAFU_NOTIFY_BIN   path to nafu-notify (default: sibling of this script)
+#
+# Requires: systemd (user session), nafu-notify on the same host.
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+  echo "Usage: nafu-bg <description> <command> [args...]" >&2
+  exit 1
+fi
+
+DESCRIPTION="$1"
+shift
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NOTIFY_SCRIPT="${NAFU_NOTIFY_BIN:-${SCRIPT_DIR}/nafu-notify}"
+
+if [ ! -x "$NOTIFY_SCRIPT" ]; then
+  echo "nafu-bg: notifier not executable at $NOTIFY_SCRIPT" >&2
+  exit 1
+fi
+
+# Escape description for use in heredoc
+ESC_DESC=$(printf '%s' "$DESCRIPTION" | sed "s/'/'\\\\''/g")
+# Serialize command args as a shell-safe quoted string
+CMD_SERIALIZED=$(printf '%q ' "$@")
+
+systemd-run --user --no-block \
+  --unit="nafu-bg-$(date +%s)" \
+  --description="nafu-bg: ${DESCRIPTION}" \
+  --setenv=PATH="${PATH}" \
+  --setenv=HOME="${HOME}" \
+  --setenv=NAFU_TG_BOT_TOKEN="${NAFU_TG_BOT_TOKEN:-}" \
+  --setenv=NAFU_TG_CHAT_ID="${NAFU_TG_CHAT_ID:-}" \
+  -- bash -c "
+    OUTPUT=\$(${CMD_SERIALIZED} 2>&1)
+    STATUS=\$?
+    if [ \$STATUS -eq 0 ]; then
+      MSG=\"✅ *Done:* ${ESC_DESC}\"
+    else
+      TAIL=\$(echo \"\$OUTPUT\" | tail -10)
+      MSG=\"❌ *Failed:* ${ESC_DESC}\n\\\`\\\`\\\`\n\${TAIL}\n\\\`\\\`\\\`\"
+    fi
+    \"${NOTIFY_SCRIPT}\" \"\$MSG\"
+  "
+
+echo "Launched in background: ${DESCRIPTION}"

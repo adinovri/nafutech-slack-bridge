@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# nafu-notify — Send a Telegram notification (used by nafu-bg-watchdog for
+# the default "telegram" notify target).
+#
+# Usage: nafu-notify <message>
+# Message supports Telegram Markdown (*bold*, `code`, ```block```).
+#
+# Reads secrets from environment (NEVER hardcode them here):
+#   NAFU_TG_BOT_TOKEN   Telegram bot token from @BotFather
+#   NAFU_TG_CHAT_ID     Chat ID to send to
+#
+# Exits 0 with a warning if either is unset — the caller (nafu-bg-watchdog)
+# treats notify failures as non-fatal, so an unconfigured Telegram target
+# should NOT crash the watchdog.
+set -euo pipefail
+
+if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "Usage: nafu-notify <message>" >&2
+  exit 1
+fi
+
+if [ -z "${NAFU_TG_BOT_TOKEN:-}" ] || [ -z "${NAFU_TG_CHAT_ID:-}" ]; then
+  logger -t nafu-notify "skip: NAFU_TG_BOT_TOKEN or NAFU_TG_CHAT_ID unset (Telegram notify disabled)"
+  exit 0
+fi
+
+curl -sS -X POST "https://api.telegram.org/bot${NAFU_TG_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${NAFU_TG_CHAT_ID}" \
+  -d "parse_mode=Markdown" \
+  --data-urlencode "text=$1" \
+  > /dev/null

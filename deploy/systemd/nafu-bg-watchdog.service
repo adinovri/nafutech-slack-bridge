@@ -1,0 +1,26 @@
+[Unit]
+Description=NafuTech background Claude session watchdog
+
+[Service]
+Type=oneshot
+ExecStart=%h/Codes/nafutech-slack-bridge/scripts/nafu-bg-watchdog
+StandardOutput=journal
+StandardError=journal
+
+# --- env ---
+# Registry path MUST match the bridge's BG_REGISTRY (defaults to
+# ~/.openclaw/bg_registry.json in both places when unset).
+# CLAUDE_WORKSPACE is where nafu-bg-claude spawned the tmux sessions from —
+# only needed by nafu-bg-claude itself, but harmless here.
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_CONFIG_DIR=%h/.claude
+Environment=BG_REGISTRY=%h/.openclaw/bg_registry.json
+Environment=NAFU_NOTIFY_BIN=%h/Codes/nafutech-slack-bridge/scripts/nafu-notify
+
+# Optional Telegram secrets (kept OUT of this world-readable unit).
+# Create ~/.config/nafutech-slack-bridge.env with mode 600:
+#   NAFU_TG_BOT_TOKEN=123456:AA...
+#   NAFU_TG_CHAT_ID=1234567890
+# The leading "-" makes the file optional (no error if absent).
+EnvironmentFile=-%h/.config/nafutech-slack-bridge.env

@@ -23,6 +23,7 @@ from .config import (
     ALT_IDLE_TTL,
     ALT_MARKER,
     BG_MARKER,
+    BG_REGISTRY,
     CLAUDE_CONFIG_DIR,
     LOG_LEVEL,
     NAFUTECH_WORKSPACE,
@@ -32,7 +33,6 @@ from .config import (
 )
 
 NAFU_BG_CLAUDE = str(NAFUTECH_WORKSPACE / "nafu-bg-claude")
-BG_REGISTRY    = Path.home() / ".openclaw" / "bg_registry.json"
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -194,7 +194,15 @@ def _dispatch(event: dict, client, bot_user_id: str | None) -> None:
             "thread_ts": thread_ts,
             "ack_ts":    ack["ts"],
         }
-        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR)}
+        env = {
+            **os.environ,
+            "CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR),
+            # Registry path MUST be consistent bridge↔worker↔watchdog.
+            "BG_REGISTRY":       str(BG_REGISTRY),
+            # nafu-bg-claude requires this — pass it through so operators
+            # only have to configure NAFUTECH_WORKSPACE in the bridge's .env.
+            "CLAUDE_WORKSPACE":  str(NAFUTECH_WORKSPACE),
+        }
         subprocess.Popen(
             ["python3", NAFU_BG_CLAUDE, f"slack:{thread_ts[:12]}", prompt,
              "--notify-json", json.dumps(notify_cfg)],

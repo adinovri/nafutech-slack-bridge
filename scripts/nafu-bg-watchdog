@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""
+nafu-bg-watchdog — Poll background Claude sessions, notify when done.
+
+Called by systemd timer every 15s. Reads $BG_REGISTRY (default:
+~/.openclaw/bg_registry.json), checks JSONL transcripts for end_turn,
+notifies via Telegram or Slack, cleans up.
+
+Also reaps orphan bridge sessions (nafu-XXXX-XXXX-XX pattern) that are not
+in the registry and have been idle > ORPHAN_IDLE_THRESHOLD_SECS. This
+catches sessions left behind when the gateway kills bridge.py with SIGKILL
+instead of SIGTERM, bypassing bridge.py's finally: _kill_session() cleanup.
+
+Environment:
+  BG_REGISTRY       shared registry file path (default: ~/.openclaw/bg_registry.json)
+  NAFU_NOTIFY_BIN   path to nafu-notify (default: sibling of this script)
+"""
+import json
+import os
+import subprocess
+import time
+import urllib.request
+
+from pathlib import Path
+
+NOTIFY_SCRIPT = Path(os.environ.get(
+    "NAFU_NOTIFY_BIN",
+    str(Path(__file__).resolve().parent / "nafu-notify"),
+))
+REGISTRY_FILE = Path(os.environ.get(
+    "BG_REGISTRY",
+    str(Path.home() / ".openclaw" / "bg_registry.json"),
+))
+
+SLACK_CHUNK_SIZE = 3800
+
+
+def _tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def _session_alive(name):
+    return _tmux("has-session", "-t", name).returncode == 0
+
+
+def _notify_telegram(msg):
+    result = subprocess.run([str(NOTIFY_SCRIPT), msg], capture_output=True, text=True)
+    if result.returncode != 0:
+        subprocess.run(["logger", "-t", "nafu-bg-watchdog", f"telegram notify failed: {msg[:200]}"])
+
+
+def _chunk_text(text, size=SLACK_CHUNK_SIZE):
+    if len(text) <= size:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > size:
+        window = remaining[:size]
+        cut = window.rfind("\n\n")
+        if cut < size // 2:
+            cut = window.rfind("\n")
+        if cut < size // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:
+            cut = size
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _slack_api(method, bot_token, payload):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"https://slack.com/api/{method}",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {bot_token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        subprocess.run(["logger", "-t", "nafu-bg-watchdog", f"slack api {method} failed: {e}"])
+
+
+def _notify_slack(notify_cfg, result_text):
+    bot_token = notify_cfg["bot_token"]
+    channel   = notify_cfg["channel"]
+    ack_ts    = notify_cfg["ack_ts"]
+    thread_ts = notify_cfg["thread_ts"]
+    chunks    = _chunk_text(result_text)
+
+    _slack_api("chat.update", bot_token, {
+        "channel": channel,
+        "ts": ack_ts,
+        "text": chunks[0],
+    })
+    for idx, extra in enumerate(chunks[1:], start=2):
+        _slack_api("chat.postMessage", bot_token, {
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "text": f"_(cont. {idx}/{len(chunks)})_\n{extra}",
+        })
+
+
+def _tools_recap(done_tools):
+    """Compact tools summary: Bash ×12, Read ×3, …"""
+    counts = {}
+    for t in done_tools:
+        name = t.split("(")[0]
+        counts[name] = counts.get(name, 0) + 1
+    parts = [f"{n} ×{c}" if c > 1 else n for n, c in counts.items()]
+    return ", ".join(parts) if parts else "(no tools)"
+
+
+def _dispatch_notify(entry, result_text, done_tools=None):
+    notify = entry.get("notify", {"type": "telegram"})
+    ntype  = notify.get("type", "telegram")
+
+    if ntype == "slack":
+        _notify_slack(notify, result_text)
+    else:
+        description = entry["description"]
+        body = (result_text or "").strip() or _tools_recap(done_tools or [])
+        if len(body) > 3800:
+            body = body[:3800] + "\n\n… _(truncated)_"
+        _notify_telegram(f"✅ *Done:* {description}\n\n{body}")
+
+
+def _dispatch_fail(entry, partial_text, reason):
+    notify      = entry.get("notify", {"type": "telegram"})
+    ntype       = notify.get("type", "telegram")
+    description = entry["description"]
+
+    if ntype == "slack":
+        _notify_slack(notify, ":warning: Maaf, task background gagal. Coba retrigger.")
+    else:
+        partial = _summarize(partial_text) if partial_text else "(no output)"
+        _notify_telegram(f"❌ *Failed:* {description} (session died)\n```\n{partial}\n```")
+
+
+def _load_registry():
+    try:
+        return json.loads(REGISTRY_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_registry(entries):
+    REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRY_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def _tool_display(name, input_dict):
+    """Format tool name + brief input preview. Mirrors alt_runner._tool_display."""
+    display_name = name
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            server = parts[1].replace("claude_ai_", "").replace("claude_", "")
+            display_name = f"{server}:{parts[2]}"
+    preview = ""
+    if input_dict:
+        for key in ("file_path", "query", "command", "prompt", "issue_key",
+                    "channel_id", "path", "page_id", "jql", "cql"):
+            val = input_dict.get(key)
+            if val and isinstance(val, str):
+                val = val.strip().replace("\n", " ")
+                preview = val[:45] + ("…" if len(val) > 45 else "")
+                break
+        if not preview:
+            for val in input_dict.values():
+                if isinstance(val, str) and val.strip():
+                    val = val.strip().replace("\n", " ")
+                    preview = val[:45] + ("…" if len(val) > 45 else "")
+                    break
+    return f"{display_name}({preview})" if preview else display_name
+
+
+def _build_output(text, done_tools):
+    """Slack-ready output: answer text + compact tool recap footer."""
+    text = (text or "").strip()
+    if done_tools:
+        recap = _tools_recap(done_tools)
+        if text:
+            return f"{text}\n\n_tools: {recap}_"
+        return f"_tools: {recap}_"
+    return text or "_(empty response)_"
+
+
+def _scan_transcript(jsonl_path, tail_offset):
+    """
+    Scan JSONL from tail_offset. Returns (result_text, done_tools, found_end_turn).
+    """
+    p = Path(jsonl_path)
+    if not p.exists():
+        return None, [], False
+
+    text_acc = []
+    pending_tools = {}
+    done_tools = []
+    found_end_turn = False
+
+    with p.open("r", encoding="utf-8", errors="replace") as fh:
+        fh.seek(tail_offset)
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            msg_type = obj.get("type")
+
+            if msg_type == "user":
+                msg = obj.get("message") or {}
+                for block in msg.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_result":
+                        tool_id = block.get("tool_use_id", "")
+                        if tool_id and tool_id in pending_tools:
+                            done_tools.append(pending_tools.pop(tool_id))
+                continue
+
+            if msg_type != "assistant":
+                continue
+            msg = obj.get("message") or {}
+            if msg.get("model") == "<synthetic>":
+                continue
+
+            has_text = False
+            turn_acc = []
+            for block in msg.get("content", []):
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    turn_acc.append(block.get("text", ""))
+                    has_text = True
+                elif btype == "tool_use":
+                    tool_id = block.get("id") or f"_noid_{len(pending_tools)}"
+                    pending_tools[tool_id] = _tool_display(
+                        block.get("name", "tool"),
+                        block.get("input") or {},
+                    )
+
+            if has_text and msg.get("stop_reason") == "end_turn":
+                text_acc = turn_acc
+                found_end_turn = True
+
+    final_text = "".join(text_acc).strip() if text_acc else None
+    if not found_end_turn:
+        return final_text, done_tools, False
+    return _build_output(final_text or "", done_tools), done_tools, True
+
+
+def _summarize(text, max_chars=800):
+    if not text:
+        return "(no output)"
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_break = max(cut.rfind(". "), cut.rfind("\n"))
+    if last_break > max_chars // 2:
+        return cut[:last_break + 1] + "\n…"
+    return cut + "\n…"
+
+
+# Bridge session orphan reaper config
+# Patterns: (match_prefix, skip_prefix). More-specific prefixes MUST come before
+# less-specific ones (e.g. "main2-" before "main-") so that main2-bg-* is caught
+# by its own skip_prefix before the broader "main-" pattern matches it.
+# Sessions matching match_prefix but NOT skip_prefix are orphan candidates.
+# The skip_prefix is the "bg-" variant that stays in the registry — never reaped.
+# Sessions with underscore prefix (nafu_*, alt_runner.py) have their own reap_idle().
+BRIDGE_PATTERNS = [
+    ("nafu-",  "nafu-bg-"),
+    ("main2-", "main2-bg-"),
+    ("main-",  "main-bg-"),
+    ("claw2-", "claw2-bg-"),
+    ("claw-",  "claw-bg-"),
+]
+ORPHAN_IDLE_THRESHOLD_SECS = 1800   # 30 minutes
+ORPHAN_CPU_ACTIVE_THRESHOLD = 10.0  # percent — skip if process is still busy
+
+
+def _is_orphan_candidate(name: str) -> bool:
+    """Return True if this tmux session is a bridge session (not a bg- variant)."""
+    for match_prefix, skip_prefix in BRIDGE_PATTERNS:
+        if name.startswith(match_prefix):
+            return not name.startswith(skip_prefix)
+    return False
+
+
+def _session_idle_secs(session_name: str) -> int | None:
+    r = _tmux("display-message", "-t", session_name, "-p", "#{session_activity}")
+    try:
+        last_activity = int(r.stdout.strip())
+        return int(time.time()) - last_activity
+    except (ValueError, AttributeError):
+        return None
+
+
+def _pane_cpu(session_name: str) -> float:
+    """Return max CPU% of the pane's process tree. Returns 0.0 on any error."""
+    r = _tmux("display-message", "-t", session_name, "-p", "#{pane_pid}")
+    try:
+        pid = int(r.stdout.strip())
+    except (ValueError, AttributeError):
+        return 0.0
+    try:
+        r1 = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pcpu", "--no-headers"],
+            capture_output=True, text=True,
+        )
+        r2 = subprocess.run(
+            ["ps", "--ppid", str(pid), "-o", "pcpu", "--no-headers"],
+            capture_output=True, text=True,
+        )
+        cpus = []
+        for line in (r1.stdout + r2.stdout).splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    cpus.append(float(line))
+                except ValueError:
+                    pass
+        return max(cpus) if cpus else 0.0
+    except Exception:
+        return 0.0
+
+
+def reap_orphan_tmux() -> None:
+    """Kill bridge-spawned sessions not in registry and idle > threshold."""
+    registered = {e["tmux_name"] for e in _load_registry()}
+
+    r = _tmux("list-sessions", "-F", "#{session_name}")
+    if r.returncode != 0:
+        return
+
+    for line in r.stdout.splitlines():
+        name = line.strip()
+        if not _is_orphan_candidate(name):
+            continue
+        if name in registered:
+            continue
+
+        idle = _session_idle_secs(name)
+        if idle is None or idle < ORPHAN_IDLE_THRESHOLD_SECS:
+            continue
+
+        cpu = _pane_cpu(name)
+        if cpu > ORPHAN_CPU_ACTIVE_THRESHOLD:
+            subprocess.run([
+                "logger", "-t", "nafu-bg-watchdog",
+                f"orphan reaper: skipping {name} (CPU {cpu:.1f}% > threshold)",
+            ])
+            continue
+
+        subprocess.run([
+            "logger", "-t", "nafu-bg-watchdog",
+            f"orphan reaper: killing {name} (idle {idle}s, CPU {cpu:.1f}%)",
+        ])
+        _tmux("kill-session", "-t", name)
+
+
+def check_entries():
+    entries = _load_registry()
+    if not entries:
+        return
+
+    remaining = []
+    for entry in entries:
+        tmux_name  = entry["tmux_name"]
+        jsonl_path = entry["jsonl_path"]
+        tail_offset = entry["tail_offset"]
+        last_text, done_tools, found_end_turn = _scan_transcript(jsonl_path, tail_offset)
+
+        if found_end_turn:
+            _dispatch_notify(entry, last_text or "(no output)", done_tools)
+            _tmux("kill-session", "-t", tmux_name)
+            continue
+
+        if not _session_alive(tmux_name):
+            _dispatch_fail(entry, last_text, reason="died")
+            continue
+
+        remaining.append(entry)
+
+    _save_registry(remaining)
+
+
+if __name__ == "__main__":
+    check_entries()
+    reap_orphan_tmux()

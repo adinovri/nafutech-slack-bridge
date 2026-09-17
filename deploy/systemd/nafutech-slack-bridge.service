@@ -1,0 +1,28 @@
+[Unit]
+Description=NafuTech Slack Bridge (Slack -> Claude Code)
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Codes/nafutech-slack-bridge
+ExecStart=%h/Codes/nafutech-slack-bridge/run.sh
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=process
+StandardOutput=append:%h/Codes/nafutech-slack-bridge/logs/bot.log
+StandardError=append:%h/Codes/nafutech-slack-bridge/logs/bot.log
+
+# --- env ---
+# Edit PATH so `tmux`, `claude`, and any homebrew binaries the bridge needs
+# resolve. Slack/Claude tokens live in .env in WorkingDirectory (run.sh sources
+# it), NOT here — this file is world-readable.
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_CONFIG_DIR=%h/.claude
+
+[Install]
+WantedBy=default.target

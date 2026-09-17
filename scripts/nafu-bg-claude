@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+"""
+nafu-bg-claude — Launch a Claude task in a background tmux session.
+
+Usage: nafu-bg-claude <description> <task_prompt> [--notify-json JSON] [--resume-session SESSION_ID]
+
+Spawns an interactive Claude TUI in a detached tmux session, injects the
+task prompt, and registers the session in $BG_REGISTRY (default:
+~/.openclaw/bg_registry.json). nafu-bg-watchdog.timer polls the registry
+and notifies when done.
+
+Environment:
+  BG_REGISTRY          shared registry file path (default: ~/.openclaw/bg_registry.json)
+  CLAUDE_WORKSPACE     workspace cwd for the spawned Claude session (REQUIRED)
+  CLAUDE_CONFIG_DIR    claude config dir (default: ~/.claude)
+  CLAUDE_CLI           path to claude binary (default: claude)
+  CLAUDE_MODEL         model name (default: claude-sonnet-4-6)
+  CLAUDE_PERMISSION_MODE  permission mode (default: bypassPermissions)
+  BRIDGE_TUI_BOOT      seconds to wait for TUI prompt (default: 20)
+
+--notify-json: JSON string for notification target. Default: {"type":"telegram"}
+  Slack: {"type":"slack","bot_token":"xoxb-...","channel":"C...","thread_ts":"...","ack_ts":"..."}
+
+--resume-session: Resume an existing Claude session by its UUID (uses --resume flag).
+  When set, the existing session's transcript is continued instead of a fresh one.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        print(
+            f"[nafu-bg-claude] required env var {name} is not set. "
+            f"Set it explicitly (e.g. via systemd Environment= or the bridge's .env).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return val
+
+
+CLAUDE_CLI    = os.environ.get("CLAUDE_CLI",             "claude")
+CLAUDE_CONFIG = Path(os.environ.get("CLAUDE_CONFIG_DIR",
+                     os.path.expanduser("~/.claude")))
+CLAUDE_MODEL  = os.environ.get("CLAUDE_MODEL",           "claude-sonnet-4-6")
+CLAUDE_PERM   = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions")
+WORKSPACE     = Path(_require_env("CLAUDE_WORKSPACE"))
+REGISTRY_FILE = Path(os.environ.get(
+    "BG_REGISTRY",
+    str(Path.home() / ".openclaw" / "bg_registry.json"),
+))
+TUI_BOOT      = float(os.environ.get("BRIDGE_TUI_BOOT",  "20"))
+
+_STATUSBAR_RE   = re.compile(r"\d[\d.]*K?/\d[\d.]*K")
+_MENU_CURSOR_RE = re.compile(r"^\s*❯\s*\d+\.", re.M)
+
+
+def _tmux(*args):
+    return subprocess.run(["tmux", *args], capture_output=True, text=True)
+
+
+def _session_alive(name):
+    return _tmux("has-session", "-t", name).returncode == 0
+
+
+def _mangled_cwd():
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(WORKSPACE))
+
+
+def _transcript_path(claude_uuid):
+    return CLAUDE_CONFIG / "projects" / _mangled_cwd() / f"{claude_uuid}.jsonl"
+
+
+def _real_prompt_marker(pane):
+    return (
+        any(kw in pane for kw in ("shift+tab to cycle", "for shortcuts", "│ >"))
+        or bool(_STATUSBAR_RE.search(pane))
+    )
+
+
+def _is_interstitial(pane):
+    if _real_prompt_marker(pane):
+        return False
+    return bool(_MENU_CURSOR_RE.search(pane)) or "Enter to confirm" in pane
+
+
+def _wait_ready(tmux_name):
+    deadline = time.monotonic() + TUI_BOOT
+    last_pane = None
+    stable_hits = 0
+    dismissed = 0
+    while time.monotonic() < deadline:
+        if not _session_alive(tmux_name):
+            return False
+        pane = _tmux("capture-pane", "-p", "-t", tmux_name).stdout
+        if _is_interstitial(pane) and dismissed < 5:
+            _tmux("send-keys", "-t", tmux_name, "Enter")
+            dismissed += 1
+            stable_hits = 0
+            last_pane = None
+            time.sleep(0.8)
+            continue
+        ready = _real_prompt_marker(pane)
+        if ready and pane == last_pane:
+            stable_hits += 1
+            if stable_hits >= 2:
+                time.sleep(0.8)
+                return True
+        else:
+            stable_hits = 0
+        last_pane = pane
+        time.sleep(0.4)
+    return False
+
+
+def _send_prompt(tmux_name, prompt):
+    probe = next(
+        (ln.strip()[:40] for ln in prompt.splitlines() if len(ln.strip()) >= 4),
+        prompt.strip()[:40],
+    )
+    for paste_try in range(3):
+        if paste_try > 0:
+            _tmux("send-keys", "-t", tmux_name, "Escape")
+            time.sleep(0.2)
+            _tmux("send-keys", "-t", tmux_name, "C-u")
+            time.sleep(0.2)
+        _tmux("set-buffer", "--", prompt)
+        _tmux("paste-buffer", "-t", tmux_name)
+        rendered = False
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            pane = _tmux("capture-pane", "-p", "-t", tmux_name).stdout
+            if (probe and probe in pane) or "[Pasted text #" in pane:
+                rendered = True
+                break
+        if rendered:
+            time.sleep(0.4)
+            _tmux("send-keys", "-t", tmux_name, "Enter")
+            return True
+        print(f"[nafu-bg-claude] paste not visible on {tmux_name}, retry {paste_try+1}/3",
+              file=sys.stderr)
+    _tmux("send-keys", "-t", tmux_name, "Enter")
+    return False
+
+
+def _load_registry():
+    try:
+        return json.loads(REGISTRY_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_registry(entries):
+    REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRY_FILE.write_text(json.dumps(entries, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Launch Claude task in background tmux")
+    parser.add_argument("description", help="Human-readable task description")
+    parser.add_argument("task_prompt", help="Prompt to send to Claude")
+    parser.add_argument(
+        "--notify-json", default=None,
+        help='JSON notification config, e.g. \'{"type":"telegram"}\' or Slack config',
+    )
+    parser.add_argument(
+        "--resume-session", default=None, metavar="SESSION_ID",
+        help="Resume an existing Claude session by UUID (uses --resume instead of --session-id)",
+    )
+    args = parser.parse_args()
+
+    description = args.description
+    task_prompt = args.task_prompt
+    notify = json.loads(args.notify_json) if args.notify_json else {"type": "telegram"}
+
+    bg_id     = uuid.uuid4().hex[:8]
+    tmux_name = f"nafu-bg-{bg_id}"
+
+    if args.resume_session:
+        claude_uuid  = args.resume_session
+        session_flag = ["--resume", claude_uuid]
+    else:
+        claude_uuid  = str(uuid.uuid4())
+        session_flag = ["--session-id", claude_uuid]
+
+    jsonl = _transcript_path(claude_uuid)
+
+    r = _tmux(
+        "new-session", "-d", "-s", tmux_name,
+        "-x", "220", "-y", "50",
+        "-c", str(WORKSPACE),
+        "env", f"CLAUDE_CONFIG_DIR={CLAUDE_CONFIG}",
+        CLAUDE_CLI, "--model", CLAUDE_MODEL,
+        "--permission-mode", CLAUDE_PERM,
+        *session_flag,
+    )
+    if r.returncode != 0:
+        print(f"[nafu-bg-claude] tmux spawn failed: {r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    if not _wait_ready(tmux_name):
+        print("[nafu-bg-claude] TUI boot timeout — continuing optimistically", file=sys.stderr)
+
+    tail_offset = jsonl.stat().st_size if jsonl.exists() else 0
+    _send_prompt(tmux_name, task_prompt)
+
+    entry = {
+        "bg_id":          bg_id,
+        "tmux_name":      tmux_name,
+        "claude_uuid":    claude_uuid,
+        "jsonl_path":     str(jsonl),
+        "tail_offset":    tail_offset,
+        "description":    description,
+        "started_at":     datetime.now(timezone.utc).isoformat(),
+        "slack_thread_ts": notify.get("thread_ts"),
+        "notify":         notify,
+    }
+    entries = _load_registry()
+    entries.append(entry)
+    _save_registry(entries)
+
+    print(f"Background Claude launched [{tmux_name}] — {description}")
+
+
+if __name__ == "__main__":
+    main()

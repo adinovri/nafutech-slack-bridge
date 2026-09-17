@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent for the NafuTech Slack Bridge.
+  Copy to ~/Library/LaunchAgents/ and replace USERNAME with your Mac username
+  (echo "$(whoami)"). Adjust the PATH entry for Intel (/usr/local/bin) vs
+  Apple Silicon (/opt/homebrew/bin) Homebrew.
+
+  LaunchAgents require ABSOLUTE paths — "~" does not expand here.
+
+  Load / start:
+    launchctl bootstrap gui/$(id -u) \
+      ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist
+    launchctl enable   gui/$(id -u)/io.nanovest.nafutech-slack-bridge
+    launchctl kickstart -k gui/$(id -u)/io.nanovest.nafutech-slack-bridge
+
+  Unload / disable autostart:
+    launchctl bootout gui/$(id -u) \
+      ~/Library/LaunchAgents/io.nanovest.nafutech-slack-bridge.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.nanovest.nafutech-slack-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/USERNAME/Codes/nafutech-slack-bridge/run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/USERNAME/Codes/nafutech-slack-bridge</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/USERNAME</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CLAUDE_CONFIG_DIR</key>
+    <string>/Users/USERNAME/.claude</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/USERNAME/Codes/nafutech-slack-bridge/logs/bot.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/USERNAME/Codes/nafutech-slack-bridge/logs/bot.log</string>
+</dict>
+</plist>
