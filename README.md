@@ -250,11 +250,19 @@ they're re-copied.
 
 ### Optional — Telegram notify for `[bg]` fallback
 
-`[bg]` tasks always notify Slack (that's what the bridge sets on dispatch).
-If you also use `scripts/nafu-bg` (a generic "run any shell command in
-background") or trigger `nafu-bg-claude` outside the bridge, the fallback
-notifier is Telegram via `scripts/nafu-notify`. Give it credentials in a
-private file:
+> **If you only use the Slack bridge, SKIP this whole section.** Nothing to
+> install, nothing to configure. Every Slack path (default, `[alt]`, `[bg]`)
+> notifies Slack — Telegram is never touched. `nafu-notify` gracefully exits
+> when the env vars are absent, so unused code stays quiet.
+
+Telegram is only used when:
+1. You run `scripts/nafu-bg <desc> <cmd> …` directly — the generic "run any
+   shell command in background" helper always notifies via Telegram.
+2. You manually invoke `scripts/nafu-bg-claude` with
+   `--notify-json '{"type":"telegram"}'` (or with no `--notify-json`, since
+   telegram is the default there when called outside the bridge).
+
+To enable it, drop a private env file at `~/.config/nafutech-slack-bridge.env`:
 
 ```bash
 umask 077
