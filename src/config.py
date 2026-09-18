@@ -14,7 +14,6 @@ def _env(key: str, default: str | None = None, required: bool = False) -> str:
 
 SLACK_BOT_TOKEN = _env("SLACK_BOT_TOKEN", required=True)
 SLACK_APP_TOKEN = _env("SLACK_APP_TOKEN", required=True)
-SLACK_TEAM_ID = _env("SLACK_TEAM_ID", "T02M409AZV4")
 TRIGGER_USER_ID = _env("TRIGGER_USER_ID", "U051UM31HDF")
 
 NAFUTECH_WORKSPACE = Path(

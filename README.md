@@ -390,7 +390,14 @@ TRIGGER_USER_ID      U051UM31HDF Slack user ID allowed to trigger the bot
 
 # Claude
 CLAUDE_CLI           claude      path to claude binary
-CLAUDE_CONFIG_DIR    ~/.claude   config dir (injected by systemd; controls account/profile)
+CLAUDE_CONFIG_DIR    ~/.claude   claude CLI config dir (OAuth creds + JSONL transcripts)
+                                 Resolution order (first wins):
+                                   1. systemd unit Environment=/launchd EnvironmentVariables
+                                   2. this .env file
+                                   3. shell env
+                                   4. default (~/.claude)
+                                 Multi-account setups pin this per-service in the
+                                 systemd unit, not in .env.
 CLAUDE_MODEL         claude-sonnet-4-6
 CLAUDE_PERMISSION_MODE  bypassPermissions
 CLAUDE_TIMEOUT       600         max seconds to wait for any response
