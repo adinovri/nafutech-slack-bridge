@@ -133,6 +133,44 @@ App: `nanotech_bot` (existing).
 > Note: `message.channels`/`message.groups`/`message.mpim` are intentionally NOT
 > subscribed — channel mentions go through `app_mention` only.
 
+### Finding your Slack user ID (for `TRIGGER_USER_ID`)
+
+You'll set `TRIGGER_USER_ID` in `.env` to a `U…` string that identifies
+whichever Slack account should be allowed to talk to the bridge (usually
+your own).
+
+**Easiest — from the Slack app:** click your avatar (top-right) → **View
+profile** → in the panel that opens, click the **⋮** menu next to *Edit
+Profile* → **Copy member ID**. Works on desktop, web, and mobile.
+
+**From a Slack profile URL:** open anyone's profile in the Slack web app;
+the URL is `https://<workspace>.slack.com/team/U0XXXXXXX` — the last segment
+is that person's UID.
+
+**Via the API (needs a bot token that has `users:read.email` for lookup, or
+`users:read` for the list):**
+
+```bash
+# by email
+curl -sH "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  --data-urlencode "email=you@company.com" \
+  https://slack.com/api/users.lookupByEmail | jq '.user.id'
+
+# or grep the full member list
+curl -sH "Authorization: Bearer $SLACK_BOT_TOKEN" \
+  https://slack.com/api/users.list | \
+  jq -r '.members[] | "\(.id)\t\(.real_name)\t\(.name)"' | \
+  grep -i "your name"
+```
+
+**Once the bridge is already running with someone else's UID:** DM the bot
+from your own account (bridge will ignore silently), then:
+
+```bash
+journalctl --user -fu nafutech-slack-bridge | grep trigger
+# → trigger: channel=D… thread_ts=… user=U0XXXXXXX   ← that's you
+```
+
 ## Prerequisites
 
 Both `run_linux.sh` and `run_mac.sh` check these for you and print an
