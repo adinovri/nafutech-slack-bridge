@@ -1,10 +1,14 @@
 # nafutech-slack-bridge
 
-Thin Slack listener: when **Adi (`U051UM31HDF`) messages the bot** — either via
-@-mention in a channel where the bot is invited, or via direct DM — this process
-spawns a `claude` CLI session inside the NafuTech workspace and posts the result
-back in-thread. Followup messages in the same thread resume the same Claude
-session.
+Thin Slack listener: when **one whitelisted Slack user** (configured via
+`TRIGGER_USER_ID`; the shipped default is Adi, `U051UM31HDF`) **messages the
+bot** — either via @-mention in a channel where the bot is invited, or via
+direct DM — this process spawns a `claude` CLI session inside the NafuTech
+workspace and posts the result back in-thread. Followup messages in the same
+thread resume the same Claude session.
+
+Any Slack user ID works; the "only Adi" behavior is just what the default
+`.env.example` ships with. Change `TRIGGER_USER_ID` to redirect the gate.
 
 Identity: `nanotech_bot` (B0B1ME870DP), workspace `T02M409AZV4`.
 
@@ -15,7 +19,7 @@ Slack message (any channel/DM the bot is in)
   ├─> channel/group/mpim: bot @-mentioned  → app_mention event
   └─> DM (im)            : any message     → message event (channel_type=im)
         │
-        └─> sender == Adi (U051UM31HDF)?
+        └─> sender == TRIGGER_USER_ID?   (default: U051UM31HDF = Adi)
               ├─> no  → ignore silently
               └─> yes → _dispatch()
                           │
@@ -118,13 +122,13 @@ App: `nanotech_bot` (existing).
 3. **OAuth & Permissions** → Bot Token Scopes, ensure these are present:
    - `chat:write`
    - `app_mentions:read`
-   - `im:history` (for DMs from Adi)
+   - `im:history` (for DMs from the whitelisted user)
    - `users:read`
 4. **Event Subscriptions** → Enable Events, subscribe bot to:
    - `app_mention`           (channel/group/mpim @-mentions of the bot)
-   - `message.im`            (Adi DMs the bot)
+   - `message.im`            (whitelisted user DMs the bot)
 5. **Reinstall App** to workspace after scope changes
-6. **Invite bot to channels** Adi wants reachable from (`/invite @nanotech_bot`)
+6. **Invite bot to channels** you want it reachable from (`/invite @nanotech_bot`)
 
 > Note: `message.channels`/`message.groups`/`message.mpim` are intentionally NOT
 > subscribed — channel mentions go through `app_mention` only.
@@ -413,7 +417,9 @@ tmux ls 2>/dev/null | grep -E '^bg_|^nafu-bg-'
 ## Security notes
 
 - Bot runs with `--permission-mode bypassPermissions` → full tool access including Bash/Edit/MCP.
-  The sender-check (`event.user == U051UM31HDF`) is the only gate.
-- Non-Adi senders are silently dropped — bot stays quiet so it's safe to invite
-  it to shared channels.
+  The sender-check (`event.user == TRIGGER_USER_ID`, one whitelisted UID) is
+  the only gate. Set `TRIGGER_USER_ID` in `.env` to your own Slack UID before
+  deploying.
+- Senders whose UID doesn't match are silently dropped — bot stays quiet so
+  it's safe to invite it to shared channels.
 - Bot token in `.env` (mode 600) — do NOT commit. `.gitignore` covers `.env` + `threads/`.
